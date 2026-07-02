@@ -660,7 +660,9 @@ func TestNewSendsInitialPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(decoded) != "Fix reader race\n" || !strings.Contains(rawDelivery, `"state":"Accepted"`) {
+	// The initial prompt is submitted with a carriage return (the Enter byte a
+	// provider TUI reads), not a bare line feed.
+	if string(decoded) != "Fix reader race\r" || !strings.Contains(rawDelivery, `"state":"Accepted"`) {
 		t.Fatalf("input=%q delivery=%s", string(decoded), rawDelivery)
 	}
 }

@@ -571,3 +571,56 @@ Everything else exercised behaved correctly: worktree creation on
 and — notably — `worktree close` was correctly **blocked** ("no remote tracking
 proof — No files were removed", exit 3), exactly the data-loss guard and copy the
 content-design specifies.
+
+## High-risk path validation (2026-07-01, second e2e session)
+
+The four highest-risk untested paths were then driven end-to-end against real
+tmux/git/claude/codex. Two passed clean; prompt detection surfaced five real
+bugs (all fixed with tests).
+
+**1. Worktree close *success* path — PASSED.** With a bare remote configured and
+the `agency/<name>` branch pushed (remote-tracking proof), `worktree close`
+transitioned close→closing→removed: the git worktree and its directory were
+removed (only `main` remained), the branch was *kept* ("branch … remains" — no
+branch deletion, data-safe), and `worktree list` went empty.
+
+**2. Prompt-state detection — five bugs found and fixed.**
+- **Runner PTY had no window size** (`openPTY` never set `TIOCSWINSZ`), so the
+  child terminal was 0x0 and claude/codex rendered garbled (wrapping at ~45
+  cols), which also split prompt phrases across lines. The runner now sizes the
+  child PTY to its own controlling terminal (the tmux pane), else 80x24. Verified:
+  rendering went from garbled to clean.
+- **`agency send` submitted `\n`, not `\r`.** A provider TUI in raw mode reads
+  carriage return as Enter; a bare line feed left the typed task sitting
+  unsubmitted in claude's input box. Confirmed by manually sending `\r` (the task
+  then submitted). Both the interactive `send` path and the initial-prompt path
+  now send `\r`. This was breaking the core "send a task to the agent" workflow.
+- **Detection phrases did not match claude's real UI.** Claude renders every
+  blocking decision (trust gate, onboarding menus, tool approvals) with an
+  "Enter to confirm · Esc to cancel" footer; none of the heuristics matched, so a
+  blocked agent showed `Live`/`Quiet`. Added the observed stable signals; locked
+  with golden tests built from real captured panes (idle input box stays
+  non-prompt).
+- **The runner did not forward its stdin** (the tmux pane) to the child, so an
+  attached user's keystrokes never reached the provider — attach was effectively
+  read-only, contradicting the spec's "attach opens a session for direct
+  interaction." The runner now forwards stdin to the child PTY (socket `send`
+  remains the audited path); covered by a unit test.
+- Environment note (not an agency bug): the claude/codex launched by the runner
+  are not authenticated in this sandbox (claude returned a 401), so the *agent's
+  own work* could not be exercised — only agency's lifecycle around it.
+
+**3. `LostTmuxTarget` + repair — PASSED.** Killing a live run's tmux target was
+detected as `LostTmuxTarget` (status and `doctor`, which surfaced
+`repair: lost-tmux-target:<session>`); `agency repair` marked the unrecoverable
+run `Failed`/`Closable` and recorded RunFailed + RepairCompleted. `doctor` also
+correctly reported the `OrphanedAgencyBranch` left by test 1's close.
+
+**4. Notification delivery — PASSED.** Real events (RunStopped, RunFailed,
+RunNeedsInput) were delivered to the terminal spool
+(`logs/notifications.log`), one line per event, formatted per content-design
+("Agency: ses_… stopped / Codex was stopped in closeme.", "… failed / Runner
+failed before Codex exited. Run agency status …"). Codex prompt detection was
+observed firing for real (a delivered RunNeedsInput). One minor content polish
+applied: notification bodies now use the friendly workspace label
+(`content.WorkspaceLabel`, so `project_root` renders as "project root").

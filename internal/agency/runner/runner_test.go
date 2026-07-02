@@ -244,6 +244,41 @@ func TestRunnerGracefulStopReportsUserStoppedOnCleanExit(t *testing.T) {
 	}
 }
 
+func TestRunnerForwardsStdinToChild(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "runner.sock")
+	var output syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- Serve(ctx, Config{
+			RunID:         "run-stdin",
+			SocketPath:    socket,
+			BinaryVersion: "test",
+			Command:       []string{"/bin/sh", "-c", "read line; printf 'stdin:%s\\n' \"$line\""},
+			Stdin:         stdinR,
+			Stdout:        &output,
+			Stderr:        &bytes.Buffer{},
+		})
+	}()
+
+	conn := dialRunner(t, socket, errs)
+	defer conn.Close()
+	if _, err := runnerproto.ReadPreamble(conn); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an attached user typing into the tmux pane (the runner's stdin).
+	// It must reach the child terminal even though it never went through the
+	// socket SendInput path.
+	go func() { _, _ = stdinW.Write([]byte("typed-via-attach\n")) }()
+	eventually(t, func() bool {
+		return bytes.Contains(output.Bytes(), []byte("stdin:typed-via-attach"))
+	})
+}
+
 func TestRunnerSubscribeReplaysCapturedOutputAndWritesSpool(t *testing.T) {
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "runner.sock")

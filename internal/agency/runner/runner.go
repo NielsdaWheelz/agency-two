@@ -46,6 +46,11 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	Stdout            io.Writer
 	Stderr            io.Writer
+	// Stdin, when set, is forwarded to the child terminal so a user attached to
+	// the tmux pane can interact with the provider directly (spec: attach opens a
+	// session for direct interaction). In production this is the pane's os.Stdin;
+	// it is nil in tests and headless contexts, which disables forwarding.
+	Stdin io.Reader
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -54,6 +59,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	// The runner runs as the tmux pane's process, so its stdin is the pane: forward
+	// it to the child so an attached user can type to the provider directly.
+	cfg.Stdin = os.Stdin
 	if err := Serve(context.Background(), cfg); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -182,6 +190,12 @@ func startChild(cfg Config) (*childProcess, error) {
 		return nil, err
 	}
 	defer tty.Close()
+	// Size the child terminal before start: a freshly opened PTY defaults to 0x0,
+	// which makes full-screen provider TUIs (claude/codex) render garbled and
+	// splits prompt text across wrapped lines, defeating prompt-state detection.
+	// Match the runner's own controlling terminal (the tmux pane) when it is a
+	// TTY, else a standard 80x24.
+	setInitialWinsize(ptmx, cfg.Stdout)
 	cmd.Stdin = tty
 	cmd.Stdout = tty
 	cmd.Stderr = tty
@@ -219,9 +233,44 @@ func openPTY() (*os.File, *os.File, error) {
 	return os.NewFile(uintptr(masterFD), "agency-runner-pty-master"), os.NewFile(uintptr(slaveFD), "agency-runner-pty-slave"), nil
 }
 
+// setInitialWinsize gives the child PTY a sane terminal size. It copies the size
+// of the runner's own controlling terminal (the tmux pane, delivered as its
+// stdout) when that is a TTY, so the provider renders at the pane's dimensions;
+// otherwise it falls back to a standard 80x24. Best-effort: a failure leaves the
+// kernel default rather than aborting the launch.
+func setInitialWinsize(ptmx *os.File, stdout io.Writer) {
+	rows, cols := uint16(24), uint16(80)
+	if f, ok := stdout.(*os.File); ok {
+		if ws, err := unix.IoctlGetWinsize(int(f.Fd()), unix.TIOCGWINSZ); err == nil && ws.Row > 0 && ws.Col > 0 {
+			rows, cols = ws.Row, ws.Col
+		}
+	}
+	_ = unix.IoctlSetWinsize(int(ptmx.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: rows, Col: cols})
+}
+
 func (c *childProcess) writeInput(bytes []byte) error {
 	_, err := c.pty.Write(bytes)
 	return err
+}
+
+// forwardStdin copies the runner's stdin (the tmux pane, when attached) to the
+// child terminal so a user's keystrokes reach the provider directly. It ends on
+// EOF/read error (pane closed) or a child-write failure (child gone). It runs for
+// the process lifetime; the runner exits shortly after the child, reaping it.
+// Programmatic input continues to arrive via the socket SendInput path.
+func (s *server) forwardStdin() {
+	buf := make([]byte, 4096)
+	for {
+		n, readErr := s.cfg.Stdin.Read(buf)
+		if n > 0 {
+			if err := s.child.writeInput(buf[:n]); err != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 func (c *childProcess) stop() error {
@@ -339,6 +388,9 @@ type client struct {
 
 func (s *server) run() error {
 	defer s.closeClients()
+	if s.cfg.Stdin != nil {
+		go s.forwardStdin()
+	}
 	heartbeat := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer heartbeat.Stop()
 	acceptErr := make(chan error, 1)

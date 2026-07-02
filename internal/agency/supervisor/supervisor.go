@@ -3374,7 +3374,9 @@ func (s *Server) startSession(ctx context.Context, params StartSessionParams) (S
 	}
 	s.startOutputSubscription(ctx, created.RunID, defaultRunnerSocket(created.RunID))
 	if params.Prompt != "" {
-		if _, err := s.sendInput(ctx, created.Session, []byte(params.Prompt+"\n"), ""); err != nil {
+		// Carriage return, not line feed: a provider TUI reads CR (0x0d) as the
+		// Enter that submits the initial prompt; a bare LF leaves it unsubmitted.
+		if _, err := s.sendInput(ctx, created.Session, []byte(params.Prompt+"\r"), ""); err != nil {
 			return StartSessionResult{}, err
 		}
 	}

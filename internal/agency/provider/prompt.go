@@ -91,7 +91,12 @@ func approvalPhrases(providerKey string) []string {
 	}
 	switch providerKey {
 	case KeyClaude:
-		return append(common, "do you want to allow", "permission to")
+		// Claude Code renders every blocking decision (trust gate, tool approval,
+		// onboarding menus) with an "Enter to confirm · Esc to cancel" footer and a
+		// "❯" selector; its idle input box does not, so these reliably mark a run
+		// that is waiting on the user. Verified against the real TUI (see
+		// prompt_test.go golden captures).
+		return append(common, "do you want to allow", "permission to", "esc to cancel", "enter to confirm")
 	case KeyCodex:
 		return append(common, "approve command", "run this command?")
 	default:

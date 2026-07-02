@@ -25,6 +25,15 @@ func TestNotificationContentMatchesContentDesign(t *testing.T) {
 			body:  "Fix reader race is waiting in reader-race.",
 		},
 		{
+			name: "root workspace uses the friendly label, not the raw key",
+			notif: storage.PendingNotification{
+				EventType: "RunNeedsInput", SessionKey: "ses_aa11bb",
+				SessionTitle: "Audit logs", Workspace: "project_root", Provider: "Codex",
+			},
+			title: "Agency: ses_aa11bb needs input",
+			body:  "Audit logs is waiting in project root.",
+		},
+		{
 			name: "needs approval names the provider and workspace",
 			notif: storage.PendingNotification{
 				EventType: "RunNeedsApproval", SessionKey: "ses_f83a91",

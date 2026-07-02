@@ -60,6 +60,29 @@ func TestDetectPromptStateDoesNotMatchScrollbackOnly(t *testing.T) {
 	}
 }
 
+func TestDetectPromptStateMatchesRealClaudeMenus(t *testing.T) {
+	// Golden captures of the real Claude Code TUI (from end-to-end runs): every
+	// blocking menu ends with an "Enter to confirm · Esc to cancel" footer. These
+	// must be detected as NeedsApproval, not left as Live/Quiet.
+	trustPrompt := "Quick safety check: Is this a project you created or one you trust?\n" +
+		"Claude Code'll be able to read, edit, and execute files here.\n" +
+		"  1. Yes, proceed\n  2. No, exit\n Enter to confirm · Esc to cancel\n"
+	rendererPrompt := "Try the new fullscreen renderer?\n" +
+		"  ❯ 1. Yes, try it\n    2. Not now\n Enter to confirm · Esc to cancel\n"
+	for name, rendered := range map[string]string{"trust": trustPrompt, "renderer": rendererPrompt} {
+		hint := DetectPromptState(KeyClaude, rendered)
+		if hint.Status != "NeedsApproval" {
+			t.Fatalf("%s prompt: hint = %+v, want NeedsApproval", name, hint)
+		}
+	}
+	// Claude's idle input box (also a real capture) must NOT be flagged as a
+	// prompt — it has no "esc to cancel" footer.
+	idle := "Sonnet 4.6 with high effort\n /tmp/repo\n ❯ Try \"refactor <filepath>\"\n ? for shortcuts · ← for agents\n"
+	if hint := DetectPromptState(KeyClaude, idle); hint.Status == "NeedsApproval" || hint.Status == "NeedsInput" {
+		t.Fatalf("idle input box misdetected as a prompt: %+v", hint)
+	}
+}
+
 func TestFingerprintKnown(t *testing.T) {
 	if !FingerprintKnown(KeyClaude, "Claude Code — esc to interrupt") {
 		t.Fatal("expected known claude fingerprint")

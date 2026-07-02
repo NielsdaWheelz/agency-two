@@ -1317,7 +1317,11 @@ func runSend(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	} else {
-		input = []byte(strings.Join(args[1:], " ") + "\n")
+		// Terminate with a carriage return: pressing Enter in a terminal sends CR
+		// (0x0d), which is what a provider TUI in raw mode reads to submit its input
+		// line. A bare LF (0x0a) leaves the text sitting unsubmitted in the box.
+		// (A cooked-mode child still gets a newline via the TTY's ICRNL mapping.)
+		input = []byte(strings.Join(args[1:], " ") + "\r")
 	}
 	if replayKey == "" {
 		// Each interactive send is a distinct logical action. Deriving the replay

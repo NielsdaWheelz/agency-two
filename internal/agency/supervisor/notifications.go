@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"agency-two/internal/agency/content"
 	"agency-two/internal/agency/eventlog"
 	"agency-two/internal/agency/storage"
 )
@@ -113,7 +114,7 @@ func notificationContent(n storage.PendingNotification) (string, string) {
 	if subject == "" {
 		subject = "agency"
 	}
-	workspace := n.Workspace
+	workspace := content.WorkspaceLabel(n.Workspace)
 	if workspace == "" {
 		workspace = "its workspace"
 	}
