@@ -201,6 +201,49 @@ func TestRunnerKillStopsChildAndReportsKilled(t *testing.T) {
 	}
 }
 
+func TestRunnerGracefulStopReportsUserStoppedOnCleanExit(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "runner.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- Serve(ctx, Config{
+			RunID:         "run-stop",
+			SocketPath:    socket,
+			BinaryVersion: "test",
+			// A provider that handles SIGTERM by shutting down cleanly (exit 0),
+			// like claude/codex. Without termination-intent tracking this clean
+			// exit would be reported as ProviderExited; the user asked to stop, so
+			// it must be attributed to the user as UserStopped.
+			Command: []string{"/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 0.1; done"},
+			Stdout:  &bytes.Buffer{},
+			Stderr:  &bytes.Buffer{},
+		})
+	}()
+
+	conn := dialRunner(t, socket, errs)
+	defer conn.Close()
+	if _, err := runnerproto.ReadPreamble(conn); err != nil {
+		t.Fatal(err)
+	}
+	if err := runnerproto.WriteMessage(conn, runnerproto.NewStop(true)); err != nil {
+		t.Fatal(err)
+	}
+	exit := readExit(t, conn)
+	if exit.Termination.Outcome != "UserStopped" {
+		t.Fatalf("graceful stop of a clean-exit child = %+v, want UserStopped", exit)
+	}
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not exit")
+	}
+}
+
 func TestRunnerSubscribeReplaysCapturedOutputAndWritesSpool(t *testing.T) {
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "runner.sock")

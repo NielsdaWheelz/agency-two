@@ -517,3 +517,57 @@ noted; the whole tree passes `go build`, `go vet`, `go test ./...`, and
 4. Persist Codex `--search`/`--profile` and Claude `--settings`/`--mcp-config`
    into profile revisions from the profile-config surface.
 5. Thread per-operation actor attribution rather than by subject class.
+
+# End-to-End CLI Validation (2026-07-01)
+
+The CLI was exercised end-to-end against real `tmux`, `git`, `claude`, and
+`codex`: build the three binaries, start a supervisor with an isolated state DB
+and socket, `project init` a real git repo, launch real codex and claude agents
+(root workspace and a managed worktree), observe status, stream events, send
+input, stop/kill, and attempt worktree close. This surfaced six real bugs the
+unit suites missed; each was fixed at the source-of-truth and locked with a
+regression test.
+
+1. **Displayed tmux target unusable (supervisor).** `agency new` printed
+   `tmux: agency:ses_xxxxx` (a `session:window` target naming a nonexistent
+   `agency` session) while the real session is `agency-ses_xxxxx`. `new` now
+   renders `runnerTmuxSession(created)` — the same source-of-truth function that
+   creates the session (`attach`/`status` already used the correct name). Guard:
+   `TestNewAndListHumanAndJSON` asserts `tmux: agency-ses_`.
+2. **Empty `WORKSPACE` column in `agency list` (storage/CLI).** `SessionSummary.
+   WorkspaceKey` was `json:"-"`, so the supervisor used it internally but never
+   sent it to the CLI, which rendered an empty column. It is now serialized
+   (matching `WorktreeSummary`, and permitted by the public-payload privacy
+   policy, which forbids only internal UUIDs); `list` shows `project root`/the
+   worktree name. `path` stays private.
+3. **`RunnerAdopted` event spam + prompt-snapshot clobbering (supervisor/storage).**
+   Reconcile called `MarkRunnerAdopted` for every live binding every
+   `reconcile_interval_ms`, emitting a `RunnerAdopted` event *and deleting the run
+   status snapshot* each pass — unbounded event growth and a 15s flicker fight
+   with the 1s prompt detector. Adoption is now a transition: an already-tracked
+   runner (live output subscription) is only heartbeat-refreshed
+   (`RefreshRunnerHeartbeat`, no event, no snapshot delete); `RunnerAdopted` fires
+   once, only when re-establishing a binding with no live subscription (fresh
+   start or post-restart survivor). Verified e2e: a stable runner logged zero
+   adoptions; a supervisor restart re-adopted the survivor with exactly one.
+4. **Graceful `stop` mislabeled `Exited` (runner).** The runner mapped the
+   outcome from the child's exit *signal* only, so a provider that catches SIGTERM
+   and exits 0 (claude/codex) was reported `ProviderExited`, losing that the user
+   stopped it. The runner now records termination *intent* (stop/kill requested)
+   and attributes a clean or non-zero post-request exit to `UserStopped`/
+   `UserKilled`. Verified e2e: `stop` now yields `run: Stopped`.
+5. **`kill` on an already-terminal run leaked `TerminalOutcomeConflict`
+   (storage).** Killing a run that had already exited tried to record `UserKilled`
+   over the existing outcome and surfaced an internal invariant error. `KillRun`
+   is now an idempotent no-op when a terminal outcome exists (like `kill(2)` on a
+   finished process), preserving the recorded outcome.
+6. **State/socket directory hardening confirmed working.** The supervisor
+   correctly refused to start against a `0755` state directory (the earlier
+   private-dir hardening), validating that path end-to-end.
+
+Everything else exercised behaved correctly: worktree creation on
+`agency/<name>` with an ownership marker; Live→Quiet transition on the
+`quiet_threshold`; `events` audit log; `send` input delivery; `rename`; `diff`;
+and — notably — `worktree close` was correctly **blocked** ("no remote tracking
+proof — No files were removed", exit 3), exactly the data-loss guard and copy the
+content-design specifies.

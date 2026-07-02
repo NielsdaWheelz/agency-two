@@ -153,7 +153,21 @@ func Serve(ctx context.Context, cfg Config) error {
 type childProcess struct {
 	cmd *exec.Cmd
 	pty *os.File
+
+	mu        sync.Mutex
+	requested terminationIntent
 }
+
+// terminationIntent records whether the supervisor asked this child to stop or
+// be killed, so wait() can attribute the exit to the user even when the provider
+// responds to SIGTERM by exiting cleanly (exit 0) rather than dying by signal.
+type terminationIntent int
+
+const (
+	intentNone terminationIntent = iota
+	intentStopped
+	intentKilled
+)
 
 func startChild(cfg Config) (*childProcess, error) {
 	cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
@@ -211,11 +225,25 @@ func (c *childProcess) writeInput(bytes []byte) error {
 }
 
 func (c *childProcess) stop() error {
+	c.mu.Lock()
+	if c.requested < intentStopped {
+		c.requested = intentStopped
+	}
+	c.mu.Unlock()
 	return c.signal(syscall.SIGTERM)
 }
 
 func (c *childProcess) kill() error {
+	c.mu.Lock()
+	c.requested = intentKilled
+	c.mu.Unlock()
 	return c.signal(syscall.SIGKILL)
+}
+
+func (c *childProcess) intent() terminationIntent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requested
 }
 
 func (c *childProcess) signal(sig syscall.Signal) error {
@@ -231,8 +259,19 @@ func (c *childProcess) signal(sig syscall.Signal) error {
 
 func (c *childProcess) wait() runnerproto.Termination {
 	err := c.cmd.Wait()
+	intent := c.intent()
 	if err == nil {
-		return runnerproto.ProviderExited(0)
+		// Clean exit (code 0). A provider that handles SIGTERM/SIGKILL by shutting
+		// down gracefully exits 0, so attribute the exit to the user's request
+		// when one was made rather than reporting a spontaneous provider exit.
+		switch intent {
+		case intentKilled:
+			return runnerproto.UserKilled("SIGKILL")
+		case intentStopped:
+			return runnerproto.UserStopped()
+		default:
+			return runnerproto.ProviderExited(0)
+		}
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -248,7 +287,16 @@ func (c *childProcess) wait() runnerproto.Termination {
 					return runnerproto.RunnerFailed("ChildSignaled", status.Signal().String())
 				}
 			}
-			return runnerproto.ProviderExited(status.ExitStatus())
+			// Non-zero exit code: a provider often exits non-zero in response to a
+			// stop/kill signal it caught, so honor the recorded intent first.
+			switch intent {
+			case intentKilled:
+				return runnerproto.UserKilled("SIGKILL")
+			case intentStopped:
+				return runnerproto.UserStopped()
+			default:
+				return runnerproto.ProviderExited(status.ExitStatus())
+			}
 		}
 	}
 	return runnerproto.RunnerFailed("WaitFailed", err.Error())

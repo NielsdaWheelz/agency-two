@@ -1555,6 +1555,82 @@ func TestClearPromptHintLeavesNonPromptSnapshotUntouched(t *testing.T) {
 	}
 }
 
+func TestKillRunIsIdempotentOnTerminalRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+	// The run terminated on its own (the agent exited) just before a kill.
+	if err := store.RecordTerminalOutcome(ctx, run.RunID, "ProviderExited", `{"outcome":"ProviderExited"}`); err != nil {
+		t.Fatal(err)
+	}
+	// Killing an already-terminated run is a no-op success, not a
+	// TerminalOutcomeConflict leaked to the user.
+	if err := store.KillRun(ctx, run.Session); err != nil {
+		t.Fatalf("kill of terminal run returned error: %v", err)
+	}
+	// The recorded outcome is preserved, not overwritten with UserKilled.
+	var outcome string
+	if err := store.DB.QueryRowContext(ctx, `select outcome from run_terminal_outcomes where run_id=?`, run.RunID).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "ProviderExited" {
+		t.Fatalf("outcome = %q, want ProviderExited preserved", outcome)
+	}
+}
+
+func TestRefreshRunnerHeartbeatPreservesEventsAndPromptSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+	if err := store.BindRunner(ctx, run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "r.sock")); err != nil {
+		t.Fatal(err)
+	}
+	// A live prompt hint pins the run to NeedsInput.
+	if err := store.RecordPromptHint(ctx, run.RunID, "NeedsInput", "waiting"); err != nil {
+		t.Fatal(err)
+	}
+	// A periodic reconcile re-confirms liveness via RefreshRunnerHeartbeat. Unlike
+	// MarkRunnerAdopted it must not emit a RunnerAdopted event (log spam) nor clear
+	// the prompt snapshot (which the 1s detector would then have to re-set).
+	for i := 0; i < 3; i++ {
+		if err := store.RefreshRunnerHeartbeat(ctx, run.RunID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var adopted int
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from events where event_type='RunnerAdopted'`).Scan(&adopted); err != nil {
+		t.Fatal(err)
+	}
+	if adopted != 0 {
+		t.Fatalf("RefreshRunnerHeartbeat emitted %d RunnerAdopted events, want 0", adopted)
+	}
+	sessions, err := store.ListSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].RunStatus != "NeedsInput" {
+		t.Fatalf("heartbeat refresh disturbed the prompt snapshot: %+v", sessions)
+	}
+	// Contrast: MarkRunnerAdopted is the real transition — it does emit the event.
+	if err := store.MarkRunnerAdopted(ctx, run.RunID, 1, "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from events where event_type='RunnerAdopted'`).Scan(&adopted); err != nil {
+		t.Fatal(err)
+	}
+	if adopted != 1 {
+		t.Fatalf("MarkRunnerAdopted emitted %d RunnerAdopted events, want 1", adopted)
+	}
+}
+
 func TestLiveStatusUsesQuietAndRecentOutput(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, testDBPath(t))

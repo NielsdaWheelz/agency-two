@@ -1499,6 +1499,23 @@ func (s *Server) reconcile(ctx context.Context) error {
 			quarantined++
 			continue
 		}
+		// Adoption is a transition, not a per-pass action. A runner this
+		// supervisor already tracks (an output subscription exists — from a fresh
+		// bind or a prior adoption) is merely re-confirmed live: refresh the
+		// wall-clock heartbeat and the monotonic baseline, but do not re-emit
+		// RunnerAdopted or clear the status snapshot (which would clobber a live
+		// prompt hint every reconcile interval). Only a binding with no live
+		// subscription — a fresh start or a post-restart survivor — is adopted.
+		s.mu.Lock()
+		_, tracked := s.outputSubscriptions[binding.RunID]
+		s.mu.Unlock()
+		if tracked {
+			if err := s.store.RefreshRunnerHeartbeat(ctx, binding.RunID); err != nil {
+				return err
+			}
+			s.recordRunnerAlive(binding.RunID)
+			continue
+		}
 		if err := s.store.MarkRunnerAdopted(ctx, binding.RunID, preamble.RunnerProtocolVersion, preamble.RunnerBinaryVersion); err != nil {
 			return err
 		}
@@ -3363,7 +3380,7 @@ func (s *Server) startSession(ctx context.Context, params StartSessionParams) (S
 	}
 	return StartSessionResult{
 		Session: created.Session, Run: created.Run, Provider: gotProvider, Title: params.Title,
-		Workspace: storage.Handle("wks_", workspaceID), WorkspaceKey: workspaceKey, Path: cwd, Tmux: "agency:" + created.Session,
+		Workspace: storage.Handle("wks_", workspaceID), WorkspaceKey: workspaceKey, Path: cwd, Tmux: runnerTmuxSession(created),
 		Model: model, Effort: effort, Argv: created.Argv,
 	}, nil
 }

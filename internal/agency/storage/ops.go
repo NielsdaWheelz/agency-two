@@ -107,21 +107,25 @@ type CreatedRun struct {
 }
 
 type SessionSummary struct {
-	Session      string         `json:"session"`
-	Title        string         `json:"title"`
-	Provider     string         `json:"provider"`
-	Project      string         `json:"project"`
-	Workspace    string         `json:"workspace"`
-	RunStatus    string         `json:"runStatus"`
-	Git          map[string]any `json:"git"`
-	Model        string         `json:"model"`
-	Effort       string         `json:"effort"`
-	Close        map[string]any `json:"close"`
-	LastEvent    string         `json:"lastEventAt"`
-	WorkspaceKey string         `json:"-"`
-	Path         string         `json:"-"`
-	RunID        string         `json:"-"`
-	WorkspaceID  string         `json:"-"`
+	Session   string         `json:"session"`
+	Title     string         `json:"title"`
+	Provider  string         `json:"provider"`
+	Project   string         `json:"project"`
+	Workspace string         `json:"workspace"`
+	RunStatus string         `json:"runStatus"`
+	Git       map[string]any `json:"git"`
+	Model     string         `json:"model"`
+	Effort    string         `json:"effort"`
+	Close     map[string]any `json:"close"`
+	LastEvent string         `json:"lastEventAt"`
+	// WorkspaceKey is the workspace's stable key (for example project_root or a
+	// worktree name). It is serialized because the CLI renders the WORKSPACE
+	// column from it (via content.WorkspaceLabel); the supervisor also uses it
+	// internally to distinguish the project root from managed worktrees.
+	WorkspaceKey string `json:"workspaceKey"`
+	Path         string `json:"-"`
+	RunID        string `json:"-"`
+	WorkspaceID  string `json:"-"`
 	// HasActiveBinding is true when an active runner binding exists for the
 	// latest run. The supervisor uses it to decide LostRunner on its monotonic
 	// clock; it is not part of the public payload.
@@ -1878,6 +1882,17 @@ func (s *Store) MarkTmuxServerRestarted(ctx context.Context, key, identityJSON, 
 	return len(runIDs), tx.Commit()
 }
 
+// RefreshRunnerHeartbeat updates only the wall-clock last_heartbeat_at (display
+// and audit) for an already-adopted binding on a periodic reconcile pass. Unlike
+// MarkRunnerAdopted it emits no RunnerAdopted event and does not touch the status
+// snapshot, so a live prompt hint (NeedsInput/NeedsApproval) is never clobbered
+// and the event log is not spammed once per reconcile interval. A missing
+// binding (a run that went terminal concurrently) is a benign no-op.
+func (s *Store) RefreshRunnerHeartbeat(ctx context.Context, runID string) error {
+	_, err := s.DB.ExecContext(ctx, `update active_runner_bindings set last_heartbeat_at=? where run_id=?`, Now(), runID)
+	return err
+}
+
 func (s *Store) MarkRunnerAdopted(ctx context.Context, runID string, protocolVersion int, binaryVersion string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -2361,6 +2376,18 @@ func (s *Store) KillRun(ctx context.Context, handle string) error {
 	}
 	if detail.RunID == "" {
 		return errors.New("RunNotLive")
+	}
+	// Killing an already-terminated run is an idempotent no-op: the process is
+	// already gone, which is exactly what kill wants. Recording UserKilled over
+	// an existing outcome (for example ProviderExited when the agent exited on
+	// its own just before the kill) would surface a TerminalOutcomeConflict for
+	// what is really success.
+	var terminal int
+	if err := s.DB.QueryRowContext(ctx, `select count(*) from run_terminal_outcomes where run_id=?`, detail.RunID).Scan(&terminal); err != nil {
+		return err
+	}
+	if terminal > 0 {
+		return nil
 	}
 	return s.terminalOutcome(ctx, detail.RunID, "UserKilled", `{"outcome":"UserKilled","signal":"SIGKILL"}`)
 }

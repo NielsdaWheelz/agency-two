@@ -539,6 +539,12 @@ func TestNewAndListHumanAndJSON(t *testing.T) {
 	if !strings.Contains(out.String(), "Agent session started\nsession: ses_") {
 		t.Fatalf("unexpected new output:\n%s", out.String())
 	}
+	// The displayed tmux target must be the real session name (agency-<session>),
+	// usable directly with tmux. A divergent "agency:<session>" (session:window)
+	// form points at a nonexistent session named "agency".
+	if !strings.Contains(out.String(), "tmux: agency-ses_") {
+		t.Fatalf("new output tmux target is not the real session name:\n%s", out.String())
+	}
 
 	out.Reset()
 	errOut.Reset()
@@ -552,10 +558,15 @@ func TestNewAndListHumanAndJSON(t *testing.T) {
 			t.Fatalf("json output missing %q:\n%s", want, got)
 		}
 	}
-	for _, blocked := range []string{`"workspaceKey"`, `"path"`} {
-		if strings.Contains(got, blocked) {
-			t.Fatalf("list json leaked %s:\n%s", blocked, got)
-		}
+	// workspaceKey is a public schema key (WorktreeSummary exposes it too) and the
+	// CLI renders the WORKSPACE column from it, so it is intentionally present.
+	// path stays out of the session list payload (the working directory is not
+	// needed there and is kept minimal).
+	if !strings.Contains(got, `"workspaceKey": "project_root"`) {
+		t.Fatalf("list json should expose workspaceKey for the WORKSPACE column:\n%s", got)
+	}
+	if strings.Contains(got, `"path"`) {
+		t.Fatalf("list json leaked \"path\":\n%s", got)
 	}
 }
 
