@@ -239,6 +239,8 @@ order above; the full set is always available in the structured payload.
 - `RepositoryRole`: `Primary`.
 - `WorktreeMode`: `Prompt`, `Always`, `Never` (config ingress `prompt`,
   `always`, `never`).
+- `Theme`: `System`, `Light`, `Dark` (config ingress `system`, `light`,
+  `dark`). The UI display theme; owned by the config service.
 - `SafetyCheckKind`: `LaunchPolicy`, `StopPolicy`, `WorktreeClose`,
   `RemoteCommand`.
 - `NotificationChannelType`: `Terminal`, `Desktop`.
@@ -795,7 +797,10 @@ Append-only event log. `status_subject_id` references the deduplicated subject
 so events are joinable and indexable by subject. `event_seq` is allocated inside
 the writing transaction and is unique per `status_subject_id`. `event_type` is
 an `EventType`; `payload_json` is the `EventPayload` variant selected by
-`event_type`.
+`event_type`. `correlation_json` is a `Correlation` `{ "correlationId": text }`
+grouping events that belong to one logical operation; `causation_event_id` is
+the nullable in-log parent that directly caused this event (for example a
+`RunStopped` caused by a `StopRequested`), forming an intra-log causation chain.
 
 `EventType` values:
 
@@ -909,11 +914,13 @@ uses the owned absence representation, not JSON `null`.
   "general", "notes": "..." }`.
 - `ProviderConfig`: `{ "permissionModes": ["default"], "sandboxModes":
   ["workspace-write"], "approvalPolicies": ["on-request"] }`.
+- `Correlation`: `{ "correlationId": text }` — groups events of one logical
+  operation (see [`events`](#events)).
 - `SafetyPolicy`, `NotificationChannelSpec`, `TmuxTargetSpec`, `SocketSpec`,
   `PermissionPolicy`, `RuntimeLimits`, `ExtraArgs`, `ProviderConfig`,
   `EffectiveConfig`, `Actor`, `Location`, `Evidence`, `RemovalReason`,
-  `EventPayload` each have a named schema owned by this document's config and
-  storage model; every one is a closed shape, not an open bag.
+  `Correlation`, `EventPayload` each have a named schema owned by this document's
+  config and storage model; every one is a closed shape, not an open bag.
 
 ## Indexes
 

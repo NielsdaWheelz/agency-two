@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1376,7 +1377,7 @@ func TestSendReplayKeyDoesNotDoubleSend(t *testing.T) {
 	}
 }
 
-func TestSendDerivesReplayKeyDoesNotDoubleSend(t *testing.T) {
+func TestSendWithoutReplayKeyDeliversEachInput(t *testing.T) {
 	withState(t)
 	withLaunchTools(t)
 	repo := createCommittedRepo(t)
@@ -1396,14 +1397,19 @@ func TestSendDerivesReplayKeyDoesNotDoubleSend(t *testing.T) {
 	if code := Run([]string{"send", session, "hello", "runner"}, &out, &errOut); code != 0 {
 		t.Fatalf("send code=%d stderr=%s", code, errOut.String())
 	}
-	first := out.String()
+	if !strings.Contains(out.String(), "input: 1") {
+		t.Fatalf("first send should be input 1:\n%s", out.String())
+	}
 	out.Reset()
 	errOut.Reset()
+	// An identical send WITHOUT an explicit --replay-key is a distinct logical
+	// action and must be delivered as a new input (seq 2), never swallowed as a
+	// content-hash replay. Idempotency is opt-in via --replay-key.
 	if code := Run([]string{"send", session, "hello", "runner"}, &out, &errOut); code != 0 {
-		t.Fatalf("send replay code=%d stderr=%s", code, errOut.String())
+		t.Fatalf("second send code=%d stderr=%s", code, errOut.String())
 	}
-	if out.String() != first || !strings.Contains(out.String(), "input: 1") {
-		t.Fatalf("derived replay output mismatch\nfirst:\n%s\nsecond:\n%s", first, out.String())
+	if !strings.Contains(out.String(), "input: 2") {
+		t.Fatalf("identical send without replay key should deliver as input 2:\n%s", out.String())
 	}
 }
 
@@ -2548,6 +2554,10 @@ func TestManagedWorktreeCloseBlocksMissingTmuxTarget(t *testing.T) {
 		t.Skip("tmux is not installed")
 	}
 	repo := createCommittedRepo(t)
+	// A runner the supervisor never proved live this process lifetime is declared
+	// heartbeat-expired once the monotonic TTL elapses; a tiny TTL makes that
+	// deterministic instead of waiting the production default.
+	t.Setenv("AGENCY_HEARTBEAT_TTL_MS", "1")
 	startAppSupervisor(t)
 
 	var out, errOut bytes.Buffer
@@ -2595,10 +2605,8 @@ func TestManagedWorktreeCloseBlocksMissingTmuxTarget(t *testing.T) {
 	if err := store.BindRunner(context.Background(), run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "missing-runner.sock")); err != nil {
 		t.Fatal(err)
 	}
-	oldHeartbeat := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
-	if _, err := store.DB.ExecContext(context.Background(), `update active_runner_bindings set last_heartbeat_at=? where run_id=?`, oldHeartbeat, run.RunID); err != nil {
-		t.Fatal(err)
-	}
+	// The supervisor never adopts this bound runner (its socket does not exist),
+	// so with the tiny monotonic TTL it is heartbeat-expired by close time.
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -2833,6 +2841,23 @@ func TestMaintenanceCommands(t *testing.T) {
 		t.Fatalf("host list output:\n%s", out.String())
 	}
 
+	out.Reset()
+	errOut.Reset()
+	if code := Run([]string{"host", "install-unit"}, &out, &errOut); code != 0 {
+		t.Fatalf("host install-unit code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "ExecStart=") || !strings.Contains(out.String(), "WantedBy=default.target") {
+		t.Fatalf("install-unit output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := Run([]string{"host", "install-unit", "--launchd"}, &out, &errOut); code != 0 {
+		t.Fatalf("host install-unit --launchd code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "com.agency.supervisor") {
+		t.Fatalf("install-unit launchd output:\n%s", out.String())
+	}
+
 	store, err := storage.Open(context.Background(), os.Getenv("AGENCY_STATE_DB"))
 	if err != nil {
 		t.Fatal(err)
@@ -2879,8 +2904,10 @@ func TestMaintenanceCommands(t *testing.T) {
 	if code := Run([]string{"prune"}, &out, &errOut); code != 0 {
 		t.Fatalf("prune code=%d stderr=%s", code, errOut.String())
 	}
-	if strings.TrimSpace(out.String()) != "State pruned" {
-		t.Fatalf("prune output: %q", out.String())
+	for _, want := range []string{"State pruned", "idempotency keys:", "output chunks:", "status snapshots:"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("prune output missing %q:\n%s", want, out.String())
+		}
 	}
 
 	exportPath := filepath.Join(t.TempDir(), "agency-export.db")
@@ -3129,8 +3156,16 @@ func startAppSupervisorAt(t *testing.T, socket string) func() {
 	t.Setenv("AGENCY_SUPERVISOR_SOCKET", socket)
 	ctx, cancel := context.WithCancel(context.Background())
 	errs := make(chan error, 1)
+	cfg := supervisor.Config{StateDB: os.Getenv("AGENCY_STATE_DB"), SocketPath: socket}
+	// Tests may shrink the monotonic heartbeat TTL so an unproven runner is
+	// declared lost promptly; the config service owns this in production.
+	if raw := os.Getenv("AGENCY_HEARTBEAT_TTL_MS"); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil {
+			cfg.HeartbeatTTL = time.Duration(ms) * time.Millisecond
+		}
+	}
 	go func() {
-		errs <- supervisor.Serve(ctx, supervisor.Config{StateDB: os.Getenv("AGENCY_STATE_DB"), SocketPath: socket})
+		errs <- supervisor.Serve(ctx, cfg)
 	}()
 	stopped := false
 	stop := func() {
@@ -3274,6 +3309,9 @@ func withState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENCY_STATE_DB", filepath.Join(dir, "agency.db"))
+	// Isolate config discovery so the supervisor loads the built-in default
+	// config, not any config.toml on the developer's machine.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
 }
 
 func withLaunchTools(t *testing.T) {

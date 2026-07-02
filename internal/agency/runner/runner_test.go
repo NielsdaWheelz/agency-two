@@ -8,15 +8,39 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"agency-two/internal/agency/runnerproto"
 )
 
+// syncBuffer is a goroutine-safe io.Writer used where the runner's output
+// goroutine writes while the test goroutine inspects the accumulated bytes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func (b *syncBuffer) String() string {
+	return string(b.Bytes())
+}
+
 func TestRunnerServesPreambleAndAcksInputAfterPTYWrite(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runner.sock")
-	var output bytes.Buffer
+	var output syncBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -90,7 +114,7 @@ func TestRunnerServesPreambleAndAcksInputAfterPTYWrite(t *testing.T) {
 
 func TestRunnerDuplicateInputSeqDoesNotWriteTwice(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "runner.sock")
-	var output bytes.Buffer
+	var output syncBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -307,7 +331,7 @@ func TestRunnerPassesEnvFileToChildAndRemovesFile(t *testing.T) {
 	if err := os.WriteFile(envFile, []byte("AGENCY_TEST_ENV=from-file\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	var output bytes.Buffer
+	var output syncBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

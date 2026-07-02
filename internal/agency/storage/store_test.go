@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"agency-two/internal/agency/config"
 	"agency-two/internal/agency/eventlog"
 	"agency-two/internal/agency/provider"
 )
@@ -254,7 +255,7 @@ func TestEffectiveConfigRevisionPersistsTypedSnapshot(t *testing.T) {
 	if err := store.SetProjectDefaultWorktreeMode(ctx, project.Key, "always"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordEffectiveConfigRevision(ctx, stateDB); err != nil {
+	if err := store.RecordEffectiveConfigRevision(ctx, stateDB, config.Default()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -286,6 +287,302 @@ func TestEffectiveConfigRevisionPersistsTypedSnapshot(t *testing.T) {
 	defaults := effective["defaults"].(map[string]any)
 	if defaults["project"] != project.Key || defaults["host"] != "devbox" || defaults["worktreeMode"] != "Always" {
 		t.Fatalf("defaults effective config = %+v", defaults)
+	}
+}
+
+func TestEventsCarryCorrelationId(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+	if err := store.BindRunner(ctx, run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "runner.sock")); err != nil {
+		t.Fatal(err)
+	}
+	// BindRunner emits RunnerHeartbeatAccepted on the run subject.
+	var correlation string
+	if err := store.DB.QueryRowContext(ctx, `select correlation_json from events where event_type='RunnerHeartbeatAccepted'`).Scan(&correlation); err != nil {
+		t.Fatal(err)
+	}
+	if correlation == "" || correlation == "{}" {
+		t.Fatalf("event correlation is empty: %q", correlation)
+	}
+	if !strings.Contains(correlation, run.RunID) {
+		t.Fatalf("event correlation %q does not carry run id %q", correlation, run.RunID)
+	}
+}
+
+func TestRunStoppedLinksCausationToStopRequested(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+	if err := store.BindRunner(ctx, run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "runner.sock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StopRun(ctx, run.Session); err != nil {
+		t.Fatal(err)
+	}
+	var requestedID, causation string
+	if err := store.DB.QueryRowContext(ctx, `select event_id from events where event_type='StopRequested'`).Scan(&requestedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRowContext(ctx, `select coalesce(causation_event_id, '') from events where event_type='RunStopped'`).Scan(&causation); err != nil {
+		t.Fatal(err)
+	}
+	if causation == "" || causation != requestedID {
+		t.Fatalf("RunStopped causation = %q, want StopRequested id %q", causation, requestedID)
+	}
+}
+
+func TestPruneRemovesPastRetentionRowsOnly(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// One completed idempotency key backdated past retention, one recent.
+	for _, key := range []string{"old-key", "recent-key"} {
+		if _, _, err := store.BeginIdempotency(ctx, key, "op", "hash-"+key); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CompleteIdempotency(ctx, key, "op", "hash-"+key, "{}"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02T15:04:05.000Z")
+	if _, err := store.DB.ExecContext(ctx, `update idempotency_keys set completed_at=? where replay_key='old-key'`, old); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Prune(ctx, config.Retention{IdempotencyRetentionDays: 7, EventRetentionDays: 90, OutputRetentionDays: 14})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IdempotencyKeys != 1 {
+		t.Fatalf("pruned idempotency keys = %d, want 1", result.IdempotencyKeys)
+	}
+	var remaining int
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from idempotency_keys where replay_key='recent-key'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("recent idempotency key was pruned")
+	}
+	var gone int
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from idempotency_keys where replay_key='old-key'`).Scan(&gone); err != nil {
+		t.Fatal(err)
+	}
+	if gone != 0 {
+		t.Fatalf("old idempotency key survived retention")
+	}
+}
+
+func TestPruneAgesOutTerminalRunEventsOnly(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Two runs in one project (workspace_key 'project_root' is globally unique,
+	// so seedStorageRun cannot be called twice).
+	project, err := store.EnsureProject(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev, _, _, _, _, err := store.DefaultProfileRevision(ctx, project.ID, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkRun := func(title string) CreatedRun {
+		run, err := store.CreateRunIntent(ctx, LaunchIntent{
+			ProjectID: project.ID, WorkspaceID: project.ProjectRootWorkspace, ProfileRevisionID: rev, HostID: project.HostID,
+			Title: title, WorkingDirectory: project.RootPath, Argv: []string{"codex"}, Env: map[string]any{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return run
+	}
+	terminal := mkRun("terminal")
+	live := mkRun("live")
+
+	// Emit events on both runs; make only the first terminal.
+	if err := store.RecordStopRequested(ctx, terminal.RunID, terminal.Session); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTerminalOutcome(ctx, terminal.RunID, "UserStopped", `{"outcome":"UserStopped"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordStopRequested(ctx, live.RunID, live.Session); err != nil {
+		t.Fatal(err)
+	}
+
+	// Backdate every event well past the retention horizon.
+	old := time.Now().UTC().AddDate(0, 0, -200).Format("2006-01-02T15:04:05.000Z")
+	if _, err := store.DB.ExecContext(ctx, `update events set occurred_at=?`, old); err != nil {
+		t.Fatal(err)
+	}
+	countRun := func(runID string) int {
+		var n int
+		if err := store.DB.QueryRowContext(ctx, `select count(*) from events e
+			join status_subjects s on s.status_subject_id=e.status_subject_id
+			where s.subject_hash='Run:'||?`, runID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	terminalBefore := countRun(terminal.RunID)
+	liveBefore := countRun(live.RunID)
+	if terminalBefore == 0 || liveBefore == 0 {
+		t.Fatalf("expected events on both runs, got terminal=%d live=%d", terminalBefore, liveBefore)
+	}
+
+	// Causation parents are held back one round (a surviving child still names
+	// them), so convergence to zero can take multiple sweeps — the documented
+	// self-healing behavior. Prune repeatedly until stable.
+	totalPruned := 0
+	for i := 0; i < 5; i++ {
+		result, err := store.Prune(ctx, config.Retention{IdempotencyRetentionDays: 7, EventRetentionDays: 90, OutputRetentionDays: 14, StatusSnapshotWindow: 50})
+		if err != nil {
+			t.Fatal(err)
+		}
+		totalPruned += result.Events
+		if countRun(terminal.RunID) == 0 {
+			break
+		}
+	}
+	if got := countRun(terminal.RunID); got != 0 {
+		t.Fatalf("terminal-run events did not age out after repeated prunes: %d", got)
+	}
+	if totalPruned != terminalBefore {
+		t.Fatalf("total pruned events = %d, want %d", totalPruned, terminalBefore)
+	}
+	if got := countRun(live.RunID); got != liveBefore {
+		t.Fatalf("live-run events were pruned: before=%d after=%d", liveBefore, got)
+	}
+}
+
+func TestPruneTrimsStatusSnapshotsToWindow(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+
+	// CreateRunIntent already created the run's status subject; reuse it and add
+	// eight historical snapshots plus a latest pointer, via raw inserts so the
+	// window count is exact.
+	var subjectID string
+	if err := store.DB.QueryRowContext(ctx, `select status_subject_id from status_subjects where subject_hash=?`, "Run:"+run.RunID).Scan(&subjectID); err != nil {
+		t.Fatal(err)
+	}
+	var newestID string
+	for i := 0; i < 8; i++ {
+		id := NewID()
+		newestID = id
+		captured := time.Now().UTC().Add(time.Duration(i) * time.Second).Format("2006-01-02T15:04:05.000Z")
+		if _, err := store.DB.ExecContext(ctx, `insert into status_snapshots(status_snapshot_id, status_subject_id, captured_at, source, snapshot_hash, snapshot_json)
+			values(?, ?, ?, 'Event', ?, ?)`, id, subjectID, captured, "hash-"+id, `{"runStatus":"Live"}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB.ExecContext(ctx, `insert into latest_status_snapshots(status_subject_id, status_snapshot_id, updated_at) values(?, ?, ?)`,
+		subjectID, newestID, Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.Prune(ctx, config.Retention{IdempotencyRetentionDays: 7, EventRetentionDays: 90, OutputRetentionDays: 14, StatusSnapshotWindow: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusSnapshots != 5 {
+		t.Fatalf("pruned snapshots = %d, want 5 (8 - window 3)", result.StatusSnapshots)
+	}
+	var remaining int
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from status_snapshots where status_subject_id=?`, subjectID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 3 {
+		t.Fatalf("remaining snapshots = %d, want 3", remaining)
+	}
+	// The latest pointer must still resolve to a retained row.
+	var latestKept int
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from latest_status_snapshots l join status_snapshots s on s.status_snapshot_id=l.status_snapshot_id where l.status_subject_id=?`, subjectID).Scan(&latestKept); err != nil {
+		t.Fatal(err)
+	}
+	if latestKept != 1 {
+		t.Fatalf("latest snapshot pointer dangling after prune")
+	}
+}
+
+func TestSyncNotificationChannelsUpsertsAndDisables(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Configure a Desktop channel in addition to the seeded terminal one.
+	if err := store.SyncNotificationChannels(ctx, map[string]config.Notification{
+		"terminal": {Type: "Terminal", Events: []string{"RunFailed"}},
+		"desktop":  {Type: "Desktop", Events: []string{"RunNeedsApproval"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	enabled := func() map[string]string {
+		rows, err := store.DB.QueryContext(ctx, `select notification_channel_key, channel_type from notification_channels where disabled_at is null`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		got := map[string]string{}
+		for rows.Next() {
+			var k, ty string
+			if err := rows.Scan(&k, &ty); err != nil {
+				t.Fatal(err)
+			}
+			got[k] = ty
+		}
+		return got
+	}
+	got := enabled()
+	if got["desktop"] != "Desktop" || got["terminal"] != "Terminal" {
+		t.Fatalf("after sync, enabled channels = %+v, want terminal+desktop", got)
+	}
+
+	// Dropping desktop from config soft-disables it; terminal survives.
+	if err := store.SyncNotificationChannels(ctx, map[string]config.Notification{
+		"terminal": {Type: "Terminal", Events: []string{"RunFailed"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got = enabled()
+	if _, ok := got["desktop"]; ok {
+		t.Fatalf("desktop channel should be disabled after removal from config: %+v", got)
+	}
+	if got["terminal"] != "Terminal" {
+		t.Fatalf("terminal channel should remain enabled: %+v", got)
+	}
+	// The disabled desktop row is retained (soft-disable), not deleted.
+	var total int
+	if err := store.DB.QueryRowContext(ctx, `select count(*) from notification_channels where notification_channel_key='desktop'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("desktop channel row count = %d, want 1 (soft-disabled, not deleted)", total)
 	}
 }
 
@@ -881,7 +1178,7 @@ func TestDeleteUnpublishedManagedWorkspaceDeletesOnlyReservations(t *testing.T) 
 	}
 }
 
-func TestSelectedEventsRecordTerminalNotificationDelivery(t *testing.T) {
+func TestSelectedEventsSurfaceAsPendingNotifications(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, testDBPath(t))
 	if err != nil {
@@ -895,20 +1192,44 @@ func TestSelectedEventsRecordTerminalNotificationDelivery(t *testing.T) {
 	if err := store.StopRun(ctx, run.Session); err != nil {
 		t.Fatal(err)
 	}
-	var delivered int
-	if err := store.DB.QueryRowContext(ctx, `select count(*)
-		from notification_deliveries d
-		join notification_channels c on c.notification_channel_id=d.notification_channel_id
-		join events e on e.event_id=d.event_id
-		where c.notification_channel_key='terminal'
-			and e.event_type='RunStopped'
-			and d.attempt_seq=1
-			and d.delivered_at is not null
-			and d.failed_at is null`).Scan(&delivered); err != nil {
+	// Delivery is decoupled from the event write; RunStopped must surface as a
+	// pending terminal notification for the worker, not a synchronous delivery.
+	pending, err := store.PendingNotifications(ctx, 3)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if delivered != 1 {
-		t.Fatalf("RunStopped terminal deliveries = %d, want 1", delivered)
+	found := false
+	for _, n := range pending {
+		if n.ChannelKey == "terminal" && n.EventType == "RunStopped" {
+			if n.AttemptSeq != 1 || n.SessionKey != run.Session {
+				t.Fatalf("pending notification = %+v", n)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("RunStopped not pending for terminal channel: %+v", pending)
+	}
+	// After the worker records delivery, it is no longer pending.
+	var channelID string
+	if err := store.DB.QueryRowContext(ctx, `select notification_channel_id from notification_channels where notification_channel_key='terminal'`).Scan(&channelID); err != nil {
+		t.Fatal(err)
+	}
+	var eventID string
+	if err := store.DB.QueryRowContext(ctx, `select event_id from events where event_type='RunStopped'`).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordNotificationDelivered(ctx, channelID, eventID, 1); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.PendingNotifications(ctx, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range pending {
+		if n.EventType == "RunStopped" {
+			t.Fatalf("RunStopped still pending after delivery: %+v", n)
+		}
 	}
 }
 
@@ -1126,18 +1447,25 @@ func TestPromptHintsRecordStatusEventsAndNotifications(t *testing.T) {
 	if len(sessions) != 1 || sessions[0].RunStatus != "NeedsApproval" {
 		t.Fatalf("sessions = %+v", sessions)
 	}
-	var events, deliveries int
+	var events int
 	if err := store.DB.QueryRowContext(ctx, `select count(*) from events where event_type='RunNeedsApproval'`).Scan(&events); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DB.QueryRowContext(ctx, `select count(*)
-		from notification_deliveries d
-		join events e on e.event_id=d.event_id
-		where e.event_type='RunNeedsApproval' and d.delivered_at is not null`).Scan(&deliveries); err != nil {
+	if events != 1 {
+		t.Fatalf("events=%d, want 1", events)
+	}
+	pending, err := store.PendingNotifications(ctx, 3)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if events != 1 || deliveries != 1 {
-		t.Fatalf("events=%d deliveries=%d, want 1/1", events, deliveries)
+	approvalPending := false
+	for _, n := range pending {
+		if n.ChannelKey == "terminal" && n.EventType == "RunNeedsApproval" {
+			approvalPending = true
+		}
+	}
+	if !approvalPending {
+		t.Fatalf("RunNeedsApproval not pending for terminal channel: %+v", pending)
 	}
 	seq, err := store.AddInputEvent(ctx, run.RunID, []byte("yes\n"))
 	if err != nil {
@@ -1155,7 +1483,7 @@ func TestPromptHintsRecordStatusEventsAndNotifications(t *testing.T) {
 	}
 }
 
-func TestLiveStatusUsesHeartbeatAndQuietOutput(t *testing.T) {
+func TestClearPromptHintUnsticksResolvedPrompt(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, testDBPath(t))
 	if err != nil {
@@ -1166,27 +1494,93 @@ func TestLiveStatusUsesHeartbeatAndQuietOutput(t *testing.T) {
 	if err := store.BindRunner(ctx, run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "runner.sock")); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().UTC().Add(-time.Minute).Format("2006-01-02T15:04:05.000Z")
-	if _, err := store.DB.ExecContext(ctx, `update active_runner_bindings set last_heartbeat_at=?, bound_at=? where run_id=?`, old, old, run.RunID); err != nil {
+	// A prompt is detected, pinning the run to NeedsInput.
+	if err := store.RecordPromptHint(ctx, run.RunID, "NeedsInput", "type your message"); err != nil {
 		t.Fatal(err)
 	}
 	sessions, err := store.ListSessions(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 1 || sessions[0].RunStatus != "LostRunner" {
-		t.Fatalf("lost runner sessions = %+v", sessions)
+	if len(sessions) != 1 || sessions[0].RunStatus != "NeedsInput" {
+		t.Fatalf("sessions = %+v, want NeedsInput", sessions)
 	}
-	if err := store.RecordRunnerHeartbeat(ctx, run.RunID); err != nil {
+	// The prompt resolves outside agency (direct pane interaction / timeout); the
+	// pane no longer shows it. Clearing must revert to the derived Live status,
+	// not stick on NeedsInput forever.
+	if err := store.ClearPromptHint(ctx, run.RunID); err != nil {
 		t.Fatal(err)
 	}
 	sessions, err = store.ListSessions(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(sessions) != 1 || sessions[0].RunStatus != "Live" {
+		t.Fatalf("sessions after clear = %+v, want Live", sessions)
+	}
+}
+
+func TestClearPromptHintLeavesNonPromptSnapshotUntouched(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+	if err := store.BindRunner(ctx, run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "runner.sock")); err != nil {
+		t.Fatal(err)
+	}
+	// A RepairRequired snapshot must survive a clear: ClearPromptHint only
+	// un-pins prompt states, never a reconciliation verdict.
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := insertRunStatusSnapshot(ctx, tx, run.RunID, "Reconciliation", `{"runStatus":"RepairRequired"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ClearPromptHint(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.ListSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].RunStatus != "RepairRequired" {
+		t.Fatalf("sessions after clear = %+v, want RepairRequired preserved", sessions)
+	}
+}
+
+func TestLiveStatusUsesQuietAndRecentOutput(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, testDBPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run := seedStorageRun(t, store)
+	if err := store.BindRunner(ctx, run.RunID, run.TmuxTargetID, filepath.Join(t.TempDir(), "runner.sock")); err != nil {
+		t.Fatal(err)
+	}
+	// A live binding with no recent output and an old bind time projects to
+	// Quiet. Heartbeat liveness (LostRunner) is a supervisor monotonic-clock
+	// projection, not a store decision.
+	old := time.Now().UTC().Add(-time.Minute).Format("2006-01-02T15:04:05.000Z")
+	if _, err := store.DB.ExecContext(ctx, `update active_runner_bindings set bound_at=? where run_id=?`, old, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.ListSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(sessions) != 1 || sessions[0].RunStatus != "Quiet" {
 		t.Fatalf("quiet sessions = %+v", sessions)
 	}
+	// Recent output flips the projection to Live.
 	if err := store.AppendOutputChunk(ctx, run.RunID, 1, "Stdout", []byte("recent\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -1196,6 +1590,19 @@ func TestLiveStatusUsesHeartbeatAndQuietOutput(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].RunStatus != "Live" {
 		t.Fatalf("live sessions = %+v", sessions)
+	}
+	// A stale wall-clock heartbeat must NOT make the store report LostRunner;
+	// that determination belongs to the supervisor's monotonic clock.
+	stale := time.Now().UTC().Add(-time.Hour).Format("2006-01-02T15:04:05.000Z")
+	if _, err := store.DB.ExecContext(ctx, `update active_runner_bindings set last_heartbeat_at=? where run_id=?`, stale, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err = store.ListSessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].RunStatus == "LostRunner" {
+		t.Fatalf("store must not decide LostRunner from wall-clock: %+v", sessions)
 	}
 }
 

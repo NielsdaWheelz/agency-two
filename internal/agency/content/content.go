@@ -101,3 +101,25 @@ func ErrorText(action, reason, target, detail, next string) string {
 		"detail: " + detail + "\n" +
 		"next: " + next
 }
+
+// CannotLaunch renders a blocking launcher validation message. Launcher
+// validation is inline and blocking per the content design.
+func CannotLaunch(detail string) string {
+	return "Cannot launch. " + detail
+}
+
+// LaunchBlockedUnsupportedEffort is the launcher message for an unsupported
+// effort control.
+func LaunchBlockedUnsupportedEffort(providerKey, effort string) string {
+	return CannotLaunch("Provider " + providerKey + " does not support effort " + effort + ".")
+}
+
+// LaunchBlockedBaseRef is the launcher message for an unresolvable base ref.
+func LaunchBlockedBaseRef(ref string) string {
+	return CannotLaunch("Base ref " + ref + " could not be resolved.")
+}
+
+// LaunchBlockedTmux is the launcher message for an unavailable tmux host.
+func LaunchBlockedTmux(hostKey string) string {
+	return CannotLaunch("tmux is not available on host " + hostKey + ".")
+}

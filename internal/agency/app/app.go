@@ -24,6 +24,7 @@ import (
 	"agency-two/internal/agency/eventlog"
 	"agency-two/internal/agency/gitx"
 	"agency-two/internal/agency/provider"
+	"agency-two/internal/agency/remote"
 	"agency-two/internal/agency/storage"
 	"agency-two/internal/agency/supervisor"
 	"agency-two/internal/agency/tui"
@@ -892,16 +893,23 @@ func runNew(args []string, stdout, stderr io.Writer) int {
 		}
 		result, err := supervisor.StartSession(context.Background(), socket, params)
 		if err != nil {
-			if isDialError(err) {
+			switch {
+			case isDialError(err):
 				fmt.Fprintln(stderr, content.ErrorText("start session", "RemoteSupervisorUnavailable", socket, err.Error(), "Start agency-supervisor."))
 				return 4
-			}
-			if strings.Contains(err.Error(), "ProjectNotFound") {
+			case errorMentions(err, "ProjectNotFound"):
 				fmt.Fprintln(stderr, content.ErrorText("start session", "ProjectNotFound", cwd, err.Error(), "Run agency project init."))
 				return 1
+			case errorMentions(err, "DangerousLaunchBlocked", "SafetyDenied", "SafetyApprovalRequired"):
+				fmt.Fprintln(stderr, content.ErrorText("launch "+strings.Title(providerKey), serverErrorReason(err), title, err.Error(), "Pass --allow-dangerous to request a dangerous mode."))
+				return 3
+			case errorMentions(err, "Unsupported", "ProviderNotFound", "ProviderCliMissing"):
+				fmt.Fprintln(stderr, content.ErrorText("launch "+strings.Title(providerKey), serverErrorReason(err), title, err.Error(), "Choose a supported provider control."))
+				return 1
+			default:
+				fmt.Fprintln(stderr, content.ErrorText("start session", "Launch failed", title, err.Error(), "Run agency doctor."))
+				return 1
 			}
-			fmt.Fprintln(stderr, content.ErrorText("start session", "Launch failed", title, err.Error(), "Run agency doctor."))
-			return 1
 		}
 		if jsonOut {
 			writeJSON(stdout, result)
@@ -997,15 +1005,44 @@ func runNew(args []string, stdout, stderr io.Writer) int {
 }
 
 func runAdditional(args []string, stdout, stderr io.Writer) int {
+	// run accepts the shared new/run flag set. An additional run resumes the
+	// session's pinned workspace and profile revision, so control- and
+	// workspace-changing flags cannot apply; they are accepted (not rejected as
+	// unknown) and reported with a clear next action.
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var replayKey string
+	var replayKey, title, cwd, worktreeName, baseRef, model, effort, permissionMode, sandboxMode, approvalPolicy string
+	var jsonOut, worktree, noWorktree, allowDangerous, commandPreview bool
 	fs.StringVar(&replayKey, "replay-key", "", "")
+	fs.BoolVar(&jsonOut, "json", false, "")
+	fs.StringVar(&title, "title", "", "")
+	fs.StringVar(&cwd, "cwd", "", "")
+	fs.BoolVar(&worktree, "worktree", false, "")
+	fs.BoolVar(&noWorktree, "no-worktree", false, "")
+	fs.StringVar(&worktreeName, "worktree-name", "", "")
+	fs.StringVar(&baseRef, "base", "", "")
+	fs.StringVar(&model, "model", "", "")
+	fs.StringVar(&effort, "effort", "", "")
+	fs.StringVar(&permissionMode, "permission-mode", "", "")
+	fs.StringVar(&sandboxMode, "sandbox", "", "")
+	fs.StringVar(&approvalPolicy, "approval-policy", "", "")
+	fs.BoolVar(&allowDangerous, "allow-dangerous", false, "")
+	fs.BoolVar(&commandPreview, "command-preview", false, "")
+	fs.Func("add-dir", "", func(string) error { return nil })
+	fs.Func("env", "", func(string) error { return nil })
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, content.ErrorText("parse run command", "Invalid command input", "run", "Session handle is required.", "Run agency run <session>."))
+		return 2
+	}
+	inapplicable := title != "" || cwd != "" || worktree || noWorktree || worktreeName != "" || baseRef != "" ||
+		model != "" || effort != "" || permissionMode != "" || sandboxMode != "" || approvalPolicy != "" || allowDangerous || commandPreview
+	if inapplicable {
+		fmt.Fprintln(stderr, content.ErrorText("start run", "UnsupportedControl", args[len(args)-1],
+			"Additional runs inherit the session's workspace and profile revision.",
+			"Use agency new to launch with different controls."))
 		return 2
 	}
 	session := fs.Arg(0)
@@ -1021,6 +1058,10 @@ func runAdditional(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintln(stderr, content.ErrorText("start run", "SessionNotFound", session, err.Error(), "Run agency list."))
 		return 1
+	}
+	if jsonOut {
+		writeJSON(stdout, result)
+		return 0
 	}
 	fmt.Fprintln(stdout, "Run requested")
 	fmt.Fprintln(stdout, "session:", result.Session)
@@ -1220,9 +1261,9 @@ func runAttach(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, content.ErrorText("attach session", "RemoteSupervisorUnavailable", socket, err.Error(), "Start agency-supervisor."))
 			return 4
 		}
-		if strings.Contains(err.Error(), "LostTmuxTarget") {
+		if errorMentions(err, "LostTmuxTarget", "LostRunner", "RepairRequired") {
 			fmt.Fprintln(stderr, content.ErrorText("attach session", "Lost tmux target", args[0], err.Error(), "Run agency doctor."))
-			return 1
+			return 5
 		}
 		if strings.Contains(err.Error(), "SessionClosed") {
 			fmt.Fprintln(stderr, content.ErrorText("attach session", "SessionClosed", args[0], "Closed sessions cannot be attached.", "Run agency list."))
@@ -1279,7 +1320,12 @@ func runSend(args []string, stdout, stderr io.Writer) int {
 		input = []byte(strings.Join(args[1:], " ") + "\n")
 	}
 	if replayKey == "" {
-		replayKey = derivedReplayKey("sendInput", supervisor.SendInputParams{Session: args[0], Input: input})
+		// Each interactive send is a distinct logical action. Deriving the replay
+		// key from the input bytes would make two identical keystrokes (pressing
+		// Enter twice, sending "y" twice) collide on one key, so the second would
+		// be treated as a replay and silently dropped. A fresh per-invocation
+		// nonce keeps them distinct; --replay-key overrides for scripted retries.
+		replayKey = "sendInput:" + storage.NewID()
 	}
 	socket := defaultSupervisorSocket()
 	result, err := supervisor.SendInput(context.Background(), socket, args[0], input, replayKey)
@@ -1556,8 +1602,20 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 }
 
 func runHost(args []string, stdout, stderr io.Writer) int {
+	if len(args) >= 1 && args[0] == "install-unit" {
+		return runHostInstallUnit(args[1:], stdout, stderr)
+	}
+	if len(args) >= 1 && args[0] == "check" {
+		return runHostSSH(args[1:], stdout, stderr, "check", remote.BootstrapArgv)
+	}
+	if len(args) >= 1 && args[0] == "discover" {
+		return runHostSSH(args[1:], stdout, stderr, "discover", remote.DiscoverArgv)
+	}
+	if len(args) >= 1 && args[0] == "start" {
+		return runHostSSH(args[1:], stdout, stderr, "start", remote.StartArgv)
+	}
 	if len(args) == 0 || args[0] != "list" {
-		fmt.Fprintln(stderr, content.ErrorText("parse host command", "Invalid command input", "host", "Expected list.", "Run agency host list."))
+		fmt.Fprintln(stderr, content.ErrorText("parse host command", "Invalid command input", "host", "Expected list, check, discover, start, or install-unit.", "Run agency host list."))
 		return 2
 	}
 	fs := flag.NewFlagSet("host list", flag.ContinueOnError)
@@ -1592,6 +1650,87 @@ func runHost(args []string, stdout, stderr io.Writer) int {
 			alias = "-"
 		}
 		fmt.Fprintf(stdout, "%-11s %-15s %s\n", host.Key, host.Access.Mode, alias)
+	}
+	return 0
+}
+
+func runHostInstallUnit(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("host install-unit", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var launchd bool
+	fs.BoolVar(&launchd, "launchd", false, "")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	binary := "agency-supervisor"
+	if resolved, err := execLookPath("agency-supervisor"); err == nil {
+		binary = resolved
+	}
+	if launchd {
+		fmt.Fprintln(stdout, "# Write to ~/Library/LaunchAgents/com.agency.supervisor.plist, then:")
+		fmt.Fprintln(stdout, "# launchctl load ~/Library/LaunchAgents/com.agency.supervisor.plist")
+		fmt.Fprint(stdout, remote.LaunchdAgent(binary))
+		return 0
+	}
+	fmt.Fprintln(stdout, "# Write to ~/.config/systemd/user/agency-supervisor.service, then:")
+	fmt.Fprintln(stdout, "# systemctl --user enable --now agency-supervisor && loginctl enable-linger")
+	fmt.Fprint(stdout, remote.SystemdUserUnit(binary))
+	return 0
+}
+
+// runHostSSH resolves a configured host to its SSH alias and runs a validated
+// remote command (bootstrap check, supervisor discovery, or start). Mosh hosts
+// are attach-only; local hosts need no SSH.
+func runHostSSH(args []string, stdout, stderr io.Writer, action string, buildArgv func(string) ([]string, error)) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, content.ErrorText("parse host command", "Invalid command input", "host "+action, "Host key is required.", "Run agency host "+action+" <host>."))
+		return 2
+	}
+	hostKey := args[0]
+	socket := defaultSupervisorSocket()
+	hosts, err := supervisor.ListHosts(context.Background(), socket)
+	if err != nil {
+		if isDialError(err) {
+			fmt.Fprintln(stderr, content.ErrorText(action+" host", "RemoteSupervisorUnavailable", socket, err.Error(), "Start agency-supervisor."))
+			return 4
+		}
+		fmt.Fprintln(stderr, content.ErrorText(action+" host", "Storage error", "hosts", err.Error(), "Run agency doctor."))
+		return 1
+	}
+	var target *storage.Host
+	for i := range hosts {
+		if hosts[i].Key == hostKey {
+			target = &hosts[i]
+			break
+		}
+	}
+	if target == nil {
+		fmt.Fprintln(stderr, content.ErrorText(action+" host", "HostNotFound", hostKey, "No such host is configured.", "Run agency host list."))
+		return 1
+	}
+	if target.Access.Mode == "Local" {
+		fmt.Fprintln(stdout, "Host", hostKey, "is local; no SSH is required.")
+		return 0
+	}
+	if target.Access.Mode == "AttachOnlyMosh" {
+		fmt.Fprintln(stdout, "Host "+hostKey+" is attach-only.")
+		fmt.Fprintln(stdout, "Control-plane operations require SSH access to the remote supervisor.")
+		return 0
+	}
+	argv, err := buildArgv(target.Access.HostAlias)
+	if err != nil {
+		fmt.Fprintln(stderr, content.ErrorText(action+" host", "InvalidHostAlias", hostKey, err.Error(), "Fix the host access alias in config."))
+		return 1
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintln(stderr, content.ErrorText(action+" host", "SshCommandFailed", hostKey, strings.TrimSpace(string(out))+" "+err.Error(), "Verify SSH access to "+target.Access.HostAlias+"."))
+		return 1
+	}
+	fmt.Fprintf(stdout, "host %s (%s) %s ok\n", hostKey, target.Access.HostAlias, action)
+	if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+		fmt.Fprintln(stdout, trimmed)
 	}
 	return 0
 }
@@ -1925,7 +2064,8 @@ func runPrune(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	socket := defaultSupervisorSocket()
-	if err := supervisor.Prune(context.Background(), socket); err != nil {
+	result, err := supervisor.Prune(context.Background(), socket)
+	if err != nil {
 		if isDialError(err) {
 			fmt.Fprintln(stderr, content.ErrorText("prune state", "RemoteSupervisorUnavailable", socket, err.Error(), "Start agency-supervisor."))
 			return 4
@@ -1934,6 +2074,13 @@ func runPrune(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(stdout, "State pruned")
+	fmt.Fprintln(stdout, "idempotency keys:", result.IdempotencyKeys)
+	fmt.Fprintln(stdout, "notification deliveries:", result.NotificationDeliveries)
+	fmt.Fprintln(stdout, "close attempts:", result.CloseAttempts)
+	fmt.Fprintln(stdout, "safety checks:", result.SafetyCheckRuns)
+	fmt.Fprintln(stdout, "output chunks:", result.OutputChunks)
+	fmt.Fprintln(stdout, "status snapshots:", result.StatusSnapshots)
+	fmt.Fprintln(stdout, "events:", result.Events)
 	return 0
 }
 
@@ -2019,11 +2166,33 @@ func defaultSupervisorSocket() string {
 	if v := os.Getenv("AGENCY_SUPERVISOR_SOCKET"); v != "" {
 		return v
 	}
-	base := os.Getenv("XDG_RUNTIME_DIR")
-	if base == "" {
-		base = os.TempDir()
+	return filepath.Join(privateRuntimeDir(), "agency", "supervisor.sock")
+}
+
+// privateRuntimeDir returns a per-user runtime directory for the API socket. It
+// never falls back to the world-shared system temp directory, where another
+// user could pre-create agency/ and MITM the socket; it prefers
+// XDG_RUNTIME_DIR, then the per-uid /run/user/<uid>, then the private user cache
+// dir, then a private ~/.agency/run. The supervisor additionally asserts the
+// socket's parent directory is 0700 before binding (assertPrivateSocketDir).
+func privateRuntimeDir() string {
+	if base := os.Getenv("XDG_RUNTIME_DIR"); base != "" {
+		return base
 	}
-	return filepath.Join(base, "agency", "supervisor.sock")
+	perUID := fmt.Sprintf("/run/user/%d", os.Getuid())
+	if info, err := os.Stat(perUID); err == nil && info.IsDir() {
+		return perUID
+	}
+	if cache, err := os.UserCacheDir(); err == nil && cache != "" {
+		return cache
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".agency", "run")
+	}
+	// A uid-scoped subdirectory under temp as the last resort. It is not shared
+	// with other users' agency instances, and the supervisor still refuses to
+	// bind if the resulting socket directory is wider than 0700.
+	return filepath.Join(os.TempDir(), fmt.Sprintf("agency-%d", os.Getuid()))
 }
 
 func writeJSON(w io.Writer, v any) {
@@ -2067,18 +2236,61 @@ func closeSummary(row map[string]any) string {
 func reasonFromProviderError(err error) string {
 	var inputErr provider.InputError
 	if ok := asProviderError(err, &inputErr); ok {
-		switch inputErr.Code {
-		case "UnsupportedModel":
-			return "Unsupported model"
-		case "UnsupportedEffort":
-			return "Unsupported effort"
-		case "DangerousLaunchBlocked":
-			return "Safety denied"
-		default:
-			return inputErr.Code
+		return reasonForCode(inputErr.Code)
+	}
+	return serverErrorReason(err)
+}
+
+// reasonForCode maps a typed operation code to a human reason for content.ErrorText.
+func reasonForCode(code string) string {
+	switch code {
+	case "UnsupportedModel":
+		return "Unsupported model"
+	case "UnsupportedEffort":
+		return "Unsupported effort"
+	case "UnsupportedControl":
+		return "Unsupported control"
+	case "DangerousLaunchBlocked", "SafetyDenied":
+		return "Safety denied"
+	case "SafetyApprovalRequired":
+		return "Safety approval required"
+	case "ProviderCliMissing":
+		return "Provider CLI missing"
+	case "ProviderNotFound":
+		return "Provider not found"
+	default:
+		return code
+	}
+}
+
+// serverErrorReason recovers the typed code an operation error carries across
+// the supervisor boundary (errors serialize as "Code: detail") and maps it to a
+// human reason. Only meaningful once the error is known to carry a typed code.
+func serverErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	code, _, ok := strings.Cut(err.Error(), ":")
+	if !ok {
+		code = err.Error()
+	}
+	return reasonForCode(strings.TrimSpace(code))
+}
+
+// errorMentions reports whether the error text contains any of the typed codes.
+// Operation errors cross the supervisor boundary as strings, so the CLI must
+// classify them textually to honor the exit-code contract.
+func errorMentions(err error, codes ...string) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, code := range codes {
+		if strings.Contains(msg, code) {
+			return true
 		}
 	}
-	return "Provider input error"
+	return false
 }
 
 func asProviderError(err error, target *provider.InputError) bool {

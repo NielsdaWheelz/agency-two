@@ -13,13 +13,23 @@ import (
 	"strings"
 	"time"
 
+	"agency-two/internal/agency/config"
 	"agency-two/internal/agency/eventlog"
+	"agency-two/internal/agency/provider"
 )
 
-const (
-	heartbeatTTL   = 10 * time.Second
-	quietThreshold = 30 * time.Second
-)
+// defaultQuietThreshold bounds output silence before a live runner is labeled
+// Quiet. It is the fallback when the configuration service has not supplied
+// [timing].quiet_threshold_ms; the effective value lives on Store.quietThreshold.
+// Heartbeat liveness (LostRunner) is intentionally not evaluated here: it is a
+// monotonic-clock projection owned by the supervisor (see supervisor.runnerLost)
+// so a restart or suspend/resume never expires a live runner from a persisted
+// wall-clock delta.
+const defaultQuietThreshold = 30 * time.Second
+
+// idempotencyRecoveryWindow bounds how long an InFlight replay key is respected
+// before it is treated as abandoned by a crashed holder and reclaimed.
+const idempotencyRecoveryWindow = 5 * time.Minute
 
 type Project struct {
 	ID                   string `json:"projectId"`
@@ -112,6 +122,10 @@ type SessionSummary struct {
 	Path         string         `json:"-"`
 	RunID        string         `json:"-"`
 	WorkspaceID  string         `json:"-"`
+	// HasActiveBinding is true when an active runner binding exists for the
+	// latest run. The supervisor uses it to decide LostRunner on its monotonic
+	// clock; it is not part of the public payload.
+	HasActiveBinding bool `json:"-"`
 }
 
 type SessionDetail struct {
@@ -200,9 +214,9 @@ func (s *Store) BeginIdempotency(ctx context.Context, replayKey, operationKey, r
 		return "", false, err
 	}
 	defer tx.Rollback()
-	var storedOperation, storedHash, state string
+	var storedOperation, storedHash, state, createdAt string
 	var result sql.NullString
-	err = tx.QueryRowContext(ctx, `select operation_key, request_hash, state, result_ref_json from idempotency_keys where replay_key=?`, replayKey).Scan(&storedOperation, &storedHash, &state, &result)
+	err = tx.QueryRowContext(ctx, `select operation_key, request_hash, state, created_at, result_ref_json from idempotency_keys where replay_key=?`, replayKey).Scan(&storedOperation, &storedHash, &state, &createdAt, &result)
 	if errors.Is(err, sql.ErrNoRows) {
 		if _, err := tx.ExecContext(ctx, `insert into idempotency_keys(idempotency_key_id, replay_key, operation_key, request_hash, state, created_at)
 			values(?, ?, ?, ?, 'InFlight', ?)`, NewID(), replayKey, operationKey, requestHash, Now()); err != nil {
@@ -217,6 +231,17 @@ func (s *Store) BeginIdempotency(ctx context.Context, replayKey, operationKey, r
 		return "", false, errors.New("ReplayKeyConflict")
 	}
 	if state != "Completed" {
+		// The key is InFlight. Live same-key operations are serialized by the
+		// supervisor's conflict-key locks and complete quickly, so an InFlight
+		// row older than the recovery window belongs to a crashed holder: take it
+		// over (reset to a fresh InFlight) and let the caller re-run to
+		// completion, rather than dead-ending replay forever.
+		if created, perr := time.Parse("2006-01-02T15:04:05.000Z", createdAt); perr == nil && time.Since(created) >= idempotencyRecoveryWindow {
+			if _, err := tx.ExecContext(ctx, `update idempotency_keys set state='InFlight', created_at=?, result_ref_json=null, completed_at=null where replay_key=?`, Now(), replayKey); err != nil {
+				return "", false, err
+			}
+			return "", false, tx.Commit()
+		}
 		return "", false, errors.New("ReplayInFlight")
 	}
 	if !result.Valid {
@@ -720,8 +745,8 @@ func (s *Store) Host(ctx context.Context, key string) (Host, error) {
 	return host, err
 }
 
-func (s *Store) RecordEffectiveConfigRevision(ctx context.Context, stateDB string) error {
-	effective, err := s.EffectiveConfig(ctx, stateDB)
+func (s *Store) RecordEffectiveConfigRevision(ctx context.Context, stateDB string, cfg config.Config) error {
+	effective, err := s.EffectiveConfig(ctx, stateDB, cfg)
 	if err != nil {
 		return err
 	}
@@ -774,7 +799,11 @@ func (s *Store) LatestEffectiveConfig(ctx context.Context) (map[string]any, erro
 	return effective, nil
 }
 
-func (s *Store) EffectiveConfig(ctx context.Context, stateDB string) (map[string]any, error) {
+// EffectiveConfig blends the runtime-tunable configuration parsed from TOML
+// (timing, retention, security, ui, defaults) with the catalog projected from
+// storage (hosts, providers, profiles, projects). It is the durable, auditable
+// record persisted as a config revision.
+func (s *Store) EffectiveConfig(ctx context.Context, stateDB string, cfg config.Config) (map[string]any, error) {
 	projects, err := s.ListProjects(ctx)
 	if err != nil {
 		return nil, err
@@ -792,7 +821,15 @@ func (s *Store) EffectiveConfig(ctx context.Context, stateDB string) (map[string
 		return nil, err
 	}
 
-	defaults := map[string]any{"host": "local", "profile": "codex_default", "baseRef": "HEAD", "worktreeMode": "Prompt"}
+	defaults := map[string]any{
+		"host":         cfg.Defaults.Host,
+		"profile":      cfg.Defaults.Profile,
+		"baseRef":      cfg.Defaults.BaseRef,
+		"worktreeMode": cfg.Defaults.WorktreeMode,
+	}
+	if cfg.Defaults.Project != "" {
+		defaults["project"] = cfg.Defaults.Project
+	}
 	projectsJSON := map[string]any{}
 	for _, project := range projects {
 		profile, err := s.ProjectDefaultProfile(ctx, project.Key)
@@ -863,39 +900,52 @@ func (s *Store) EffectiveConfig(ctx context.Context, stateDB string) (map[string
 		})
 	}
 
+	logDir := cfg.Paths.LogDir
+	if logDir == "" {
+		logDir = filepath.Join(filepath.Dir(stateDB), "logs")
+	}
+	notificationsJSON := map[string]any{}
+	for key, channel := range cfg.Notifications {
+		notificationsJSON[key] = map[string]any{"type": channel.Type, "events": channel.Events}
+	}
 	return map[string]any{
 		"version": 1,
 		"paths": map[string]any{
 			"stateDb": stateDB,
-			"logDir":  filepath.Join(filepath.Dir(stateDB), "logs"),
+			"logDir":  logDir,
 		},
 		"defaults": defaults,
+		"ui": map[string]any{
+			"theme":      cfg.UI.Theme,
+			"refreshMs":  cfg.UI.RefreshMs,
+			"showClosed": cfg.UI.ShowClosed,
+		},
 		"timing": map[string]any{
-			"heartbeatIntervalMs": 2000,
-			"heartbeatTtlMs":      10000,
-			"quietThresholdMs":    30000,
-			"reconcileIntervalMs": 30000,
+			"heartbeatIntervalMs":   cfg.Timing.HeartbeatIntervalMs,
+			"heartbeatTtlMs":        cfg.Timing.HeartbeatTTLMs,
+			"quietThresholdMs":      cfg.Timing.QuietThresholdMs,
+			"gracefulStopTimeoutMs": cfg.Timing.GracefulStopTimeoutMs,
+			"reconcileIntervalMs":   cfg.Timing.ReconcileIntervalMs,
+			"suspendResumeReset":    cfg.Timing.SuspendResumeReset,
 		},
 		"retention": map[string]any{
-			"outputRetentionDays":      14,
-			"eventRetentionDays":       90,
-			"statusSnapshotWindow":     50,
-			"idempotencyRetentionDays": 7,
-			"busyTimeoutMs":            5000,
-			"journalSizeLimitBytes":    67108864,
+			"outputRetentionDays":      cfg.Retention.OutputRetentionDays,
+			"eventRetentionDays":       cfg.Retention.EventRetentionDays,
+			"statusSnapshotWindow":     cfg.Retention.StatusSnapshotWindow,
+			"idempotencyRetentionDays": cfg.Retention.IdempotencyRetentionDays,
+			"busyTimeoutMs":            cfg.Retention.BusyTimeoutMs,
+			"journalSizeLimitBytes":    cfg.Retention.JournalSizeLimitBytes,
 		},
 		"security": map[string]any{
-			"socketPeerCredentialCheck": true,
-			"tcpTunnelRequiresToken":    true,
-			"tcpTunnelLoopbackOnly":     true,
+			"socketPeerCredentialCheck": cfg.Security.SocketPeerCredentialCheck,
+			"tcpTunnelRequiresToken":    cfg.Security.TCPTunnelRequiresToken,
+			"tcpTunnelLoopbackOnly":     cfg.Security.TCPTunnelLoopbackOnly,
 		},
-		"hosts":     hostsJSON,
-		"providers": providersJSON,
-		"profiles":  profilesJSON,
-		"projects":  projectsJSON,
-		"notifications": map[string]any{
-			"channels": map[string]any{"terminal": map[string]any{"type": "Terminal", "events": []string{"RunNeedsInput", "RunNeedsApproval", "RunStopped", "RunFailed", "CloseBlocked"}}},
-		},
+		"hosts":         hostsJSON,
+		"providers":     providersJSON,
+		"profiles":      profilesJSON,
+		"projects":      projectsJSON,
+		"notifications": map[string]any{"channels": notificationsJSON},
 	}, nil
 }
 
@@ -1072,6 +1122,22 @@ func (s *Store) PublishManagedWorkspace(ctx context.Context, workspaceID string)
 	_, err := s.DB.ExecContext(ctx, `insert into active_worktrees(active_worktree_id, managed_worktree_id, published_at)
 		values(?, ?, ?)`, NewID(), managedID, Now())
 	return err
+}
+
+// RecordWorktreeReconciled appends a WorktreeReconciled audit event for a
+// managed worktree that changed state during a reconciliation pass. It is an
+// append-only audit record on the workspace subject; it never mutates canonical
+// worktree state.
+func (s *Store) RecordWorktreeReconciled(ctx context.Context, workspaceID, action string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := insertWorkspaceEvent(ctx, tx, workspaceID, string(eventlog.WorktreeReconciled), `{"action":`+quoteJSON(action)+`}`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DeleteUnpublishedManagedWorkspace(ctx context.Context, workspaceID string) error {
@@ -1421,23 +1487,14 @@ func (s *Store) CreateAdditionalRunFromPrevious(ctx context.Context, sessionHand
 	if err := json.Unmarshal([]byte(argvJSON), &argv); err != nil {
 		return CreatedRun{}, err
 	}
-	if providerKey == "claude" {
-		hasContinue := false
-		for _, token := range argv {
-			if token == "--continue" {
-				hasContinue = true
-				break
-			}
+	// The provider adapter owns the resume mechanism (e.g. Claude --continue).
+	if resumed := provider.ContinueArgv(providerKey, argv); len(resumed) != len(argv) {
+		argv = resumed
+		raw, err := json.Marshal(argv)
+		if err != nil {
+			return CreatedRun{}, err
 		}
-		if !hasContinue {
-			next := append([]string{argv[0], "--continue"}, argv[1:]...)
-			argv = next
-			raw, err := json.Marshal(argv)
-			if err != nil {
-				return CreatedRun{}, err
-			}
-			argvJSON = string(raw)
-		}
+		argvJSON = string(raw)
 	}
 	now := Now()
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -1502,6 +1559,133 @@ func (s *Store) BindRunner(ctx context.Context, runID, tmuxTargetID, endpoint st
 		return err
 	}
 	if err := insertRunEvent(ctx, tx, runID, string(eventlog.RunnerHeartbeatAccepted), `{"runnerProtocolVersion":1,"runnerBinaryVersion":"dev"}`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RunPromptTarget identifies a live run's tmux pane and provider, so the prompt
+// detector can capture the rendered snapshot and classify it per provider.
+type RunPromptTarget struct {
+	RunID       string
+	SessionName string
+	ProviderKey string
+}
+
+// LiveRunPromptTargets lists runs that are bound, not terminal, in an open
+// session, with an active tmux target — the runs whose rendered panes the prompt
+// detector inspects.
+func (s *Store) LiveRunPromptTargets(ctx context.Context) ([]RunPromptTarget, error) {
+	rows, err := s.DB.QueryContext(ctx, `select r.run_id, t.target_spec_json, p.provider_key
+		from agent_runs r
+		join agent_sessions s on s.session_id=r.session_id
+		join active_runner_bindings b on b.run_id=r.run_id
+		left join run_terminal_outcomes o on o.run_id=r.run_id
+		join session_tmux_targets st on st.session_id=s.session_id and st.detached_at is null
+		join tmux_targets t on t.tmux_target_id=st.tmux_target_id
+		join agent_profile_revisions pr on pr.profile_revision_id=s.profile_revision_id
+		join agent_providers p on p.provider_id=pr.provider_id
+		where s.closed_at is null and o.run_terminal_outcome_id is null`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var targets []RunPromptTarget
+	for rows.Next() {
+		var runID, targetSpec, providerKey string
+		if err := rows.Scan(&runID, &targetSpec, &providerKey); err != nil {
+			return nil, err
+		}
+		var spec map[string]any
+		sessionName := ""
+		if json.Unmarshal([]byte(targetSpec), &spec) == nil {
+			if value, ok := spec["session"].(string); ok {
+				sessionName = value
+			}
+		}
+		if sessionName == "" {
+			continue
+		}
+		targets = append(targets, RunPromptTarget{RunID: runID, SessionName: sessionName, ProviderKey: providerKey})
+	}
+	return targets, rows.Err()
+}
+
+// ZombieRun is a run whose start crashed between creating the tmux target and
+// binding the runner: it has an active tmux target but no binding or outcome. The
+// tmux target id lets reconciliation rebind if the runner is rediscovered alive.
+type ZombieRun struct {
+	RunID        string
+	TmuxTargetID string
+}
+
+// ZombieRuns returns the latest runs of open sessions that have an active tmux
+// target but neither a runner binding nor a terminal outcome, and whose start
+// was requested before olderThan. The grace on requested_at excludes runs still
+// mid-launch.
+func (s *Store) ZombieRuns(ctx context.Context, olderThan string) ([]ZombieRun, error) {
+	rows, err := s.DB.QueryContext(ctx, `select r.run_id, st.tmux_target_id
+		from agent_runs r
+		join agent_sessions s on s.session_id=r.session_id
+		join session_tmux_targets st on st.session_id=s.session_id and st.detached_at is null
+		left join active_runner_bindings b on b.run_id=r.run_id
+		left join run_terminal_outcomes o on o.run_id=r.run_id
+		where s.closed_at is null
+			and r.run_seq=(select max(run_seq) from agent_runs where session_id=s.session_id)
+			and b.runner_binding_id is null
+			and o.run_terminal_outcome_id is null
+			and r.requested_at < ?
+		order by r.requested_at`, olderThan)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var zombies []ZombieRun
+	for rows.Next() {
+		var z ZombieRun
+		if err := rows.Scan(&z.RunID, &z.TmuxTargetID); err != nil {
+			return nil, err
+		}
+		zombies = append(zombies, z)
+	}
+	return zombies, rows.Err()
+}
+
+// ManagedWorkspaceExists reports whether a workspace id has a managed_worktrees
+// row, used to detect on-disk agency worktree markers that no longer (or never)
+// had a managed worktree record.
+func (s *Store) ManagedWorkspaceExists(ctx context.Context, workspaceID string) (bool, error) {
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `select count(*) from managed_worktrees where workspace_id=?`, workspaceID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// RecordDoctorIssueObserved appends a DoctorIssueObserved event on the host
+// subject. Used by the mutating reconciliation engine when it observes an issue
+// (for example an adoptable orphan worktree) that has no owning domain subject.
+func (s *Store) RecordDoctorIssueObserved(ctx context.Context, hostKey, payloadJSON string) error {
+	if !json.Valid([]byte(payloadJSON)) {
+		return errors.New("invalid doctor issue payload")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var hostID string
+	if err := tx.QueryRowContext(ctx, `select host_id from hosts where host_key=? and archived_at is null`, hostKey).Scan(&hostID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("HostNotFound")
+		}
+		return err
+	}
+	subjectID, err := ensureHostSubject(ctx, tx, hostID)
+	if err != nil {
+		return err
+	}
+	if err := insertEvent(ctx, tx, subjectID, string(eventlog.DoctorIssueObserved), `{"kind":"Supervisor"}`, payloadJSON, hostID, ""); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1687,7 +1871,7 @@ func (s *Store) MarkTmuxServerRestarted(ctx context.Context, key, identityJSON, 
 		if err != nil {
 			return 0, err
 		}
-		if err := insertEvent(ctx, tx, subjectID, string(eventlog.TmuxServerRestarted), `{"kind":"Supervisor"}`, `{"tmuxServer":`+quoteJSON(key)+`,"detail":`+quoteJSON(detail)+`,"orphanedRuns":`+strconv.Itoa(len(runIDs))+`}`); err != nil {
+		if err := insertEvent(ctx, tx, subjectID, string(eventlog.TmuxServerRestarted), `{"kind":"Supervisor"}`, `{"tmuxServer":`+quoteJSON(key)+`,"detail":`+quoteJSON(detail)+`,"orphanedRuns":`+strconv.Itoa(len(runIDs))+`}`, serverID, ""); err != nil {
 			return 0, err
 		}
 	}
@@ -1841,6 +2025,31 @@ func (s *Store) RecordPromptHint(ctx context.Context, runID, status, detail stri
 		eventType = string(eventlog.RunNeedsApproval)
 	}
 	if err := insertRunEvent(ctx, tx, runID, eventType, `{"runStatus":"`+status+`","source":"PtyOutput","detail":`+quoteJSON(detail)+`}`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearPromptHint removes a stale NeedsInput/NeedsApproval pin once the pane no
+// longer shows that prompt, reverting the run to its derived Live/Quiet status.
+// It is a no-op unless the current snapshot is a prompt state, so it never
+// disturbs a RepairRequired or reconciliation snapshot. The historical
+// status_snapshots row and the RunNeedsInput/Approval event are retained for
+// audit; only the "latest" pointer is dropped so derivation resumes.
+func (s *Store) ClearPromptHint(ctx context.Context, runID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	current, err := latestRunStatusSnapshot(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if current != "NeedsInput" && current != "NeedsApproval" {
+		return tx.Commit()
+	}
+	if err := deleteRunStatusSnapshot(ctx, tx, runID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2008,12 +2217,12 @@ func (s *Store) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 		if err := rows.Scan(&session, &title, &project, &workspace, &path, &provider, &model, &effort, &closedAt, &outcome, &snapshot, &live, &created, &runID, &workspaceID, &heartbeatAt, &boundAt, &outputAt); err != nil {
 			return nil, err
 		}
-		status := deriveRunStatus(closedAt, outcome, snapshot, live, heartbeatAt, boundAt, outputAt)
+		status := deriveRunStatus(s.quietThreshold, closedAt, outcome, snapshot, live, heartbeatAt, boundAt, outputAt)
 		out = append(out, SessionSummary{
 			Session: session, Title: title, Provider: provider, Project: project, Workspace: Handle("wks_", workspaceID),
 			RunStatus: status, Git: map[string]any{"summary": "Clean", "presence": "Present", "tree": "Clean", "untracked": false, "ignoredUserFiles": false, "conflicts": false, "upstream": "Current"},
 			Model: model, Effort: effort, Close: map[string]any{"closable": !activeRunStatus(status), "summary": closeSummary(status), "blockers": closeBlockers(status)},
-			LastEvent: created, WorkspaceKey: workspace, Path: path, RunID: runID, WorkspaceID: workspaceID,
+			LastEvent: created, WorkspaceKey: workspace, Path: path, RunID: runID, WorkspaceID: workspaceID, HasActiveBinding: live,
 		})
 	}
 	return out, rows.Err()
@@ -2122,7 +2331,11 @@ func (s *Store) StopRun(ctx context.Context, handle string) error {
 		return err
 	}
 	if n == 1 {
-		if err := insertRunEvent(ctx, tx, detail.RunID, string(eventlog.RunStopped), `{"outcome":"UserStopped"}`); err != nil {
+		causation, _, err := latestRunEventID(ctx, tx, detail.RunID, string(eventlog.StopRequested))
+		if err != nil {
+			return err
+		}
+		if err := insertRunEventCaused(ctx, tx, detail.RunID, string(eventlog.RunStopped), `{"outcome":"UserStopped"}`, causation); err != nil {
 			return err
 		}
 	}
@@ -2251,7 +2464,17 @@ func (s *Store) terminalOutcome(ctx context.Context, runID, outcome, payload str
 	if err != nil {
 		return err
 	}
-	if err := insertRunEvent(ctx, tx, runID, eventType, payload); err != nil {
+	// A user-initiated terminal outcome is caused by the preceding stop request;
+	// link them so the operation can be traced.
+	causation := ""
+	if outcome == "UserStopped" || outcome == "UserKilled" {
+		if id, ok, err := latestRunEventID(ctx, tx, runID, string(eventlog.StopRequested)); err != nil {
+			return err
+		} else if ok {
+			causation = id
+		}
+	}
+	if err := insertRunEventCaused(ctx, tx, runID, eventType, payload, causation); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2343,12 +2566,332 @@ func (s *Store) MarkInputFailed(ctx context.Context, runID string, seq int, deta
 	return err
 }
 
-func (s *Store) Prune(ctx context.Context) error {
-	if _, err := s.DB.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+// PendingNotification is one (channel, event) delivery the worker still owes.
+type PendingNotification struct {
+	ChannelID    string
+	ChannelKey   string
+	ChannelType  string // Terminal | Desktop
+	EventID      string
+	EventType    string
+	SessionKey   string // best-effort human subject; "" if not a session/run event
+	SessionTitle string // session title, for content-design bodies
+	Workspace    string // workspace key of the session, for close/location context
+	Provider     string // provider display name, for actor phrasing
+	Payload      string // event payload_json, carries failure/blocker detail
+	AttemptSeq   int    // the attempt number to record for the next try
+}
+
+// SyncNotificationChannels makes notification_channels match the configured set:
+// config is authoritative. Each configured channel is upserted by key (type and
+// event spec refreshed, re-enabled), and any channel no longer configured is
+// soft-disabled so it stops delivering without losing its delivery history. A
+// configured Desktop channel is therefore reachable by the worker, not inert.
+func (s *Store) SyncNotificationChannels(ctx context.Context, channels map[string]config.Notification) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, `PRAGMA incremental_vacuum`)
+	defer tx.Rollback()
+	now := Now()
+	configured := make([]string, 0, len(channels))
+	for key, ch := range channels {
+		configured = append(configured, key)
+		spec, err := json.Marshal(map[string]any{"events": ch.Events})
+		if err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `update notification_channels
+			set channel_type=?, channel_spec_json=?, disabled_at=null where notification_channel_key=?`,
+			ch.Type, string(spec), key)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := tx.ExecContext(ctx, `insert into notification_channels(notification_channel_id, notification_channel_key, channel_type, channel_spec_json, created_at)
+				values(?, ?, ?, ?, ?)`, NewID(), key, ch.Type, string(spec), now); err != nil {
+				return err
+			}
+		}
+	}
+	if len(configured) == 0 {
+		if _, err := tx.ExecContext(ctx, `update notification_channels set disabled_at=? where disabled_at is null`, now); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	args := make([]any, 0, len(configured)+1)
+	args = append(args, now)
+	for _, k := range configured {
+		args = append(args, k)
+	}
+	q := `update notification_channels set disabled_at=? where disabled_at is null and notification_channel_key not in (?` +
+		strings.Repeat(", ?", len(configured)-1) + `)`
+	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// PendingNotifications returns undelivered (channel, event) pairs whose event
+// type is in the channel's configured event set and whose delivery is neither
+// delivered nor terminally failed and has not exhausted maxAttempts. It reads
+// state only; the worker performs delivery and records the outcome.
+func (s *Store) PendingNotifications(ctx context.Context, maxAttempts int) ([]PendingNotification, error) {
+	channels, err := s.DB.QueryContext(ctx, `select notification_channel_id, notification_channel_key, channel_type, channel_spec_json from notification_channels where disabled_at is null`)
+	if err != nil {
+		return nil, err
+	}
+	type channel struct {
+		id, key, kind string
+		events        map[string]bool
+	}
+	var configured []channel
+	for channels.Next() {
+		var id, key, kind, rawSpec string
+		if err := channels.Scan(&id, &key, &kind, &rawSpec); err != nil {
+			channels.Close()
+			return nil, err
+		}
+		var spec struct {
+			Events []string `json:"events"`
+		}
+		if err := json.Unmarshal([]byte(rawSpec), &spec); err != nil {
+			channels.Close()
+			return nil, err
+		}
+		set := map[string]bool{}
+		for _, e := range spec.Events {
+			set[e] = true
+		}
+		configured = append(configured, channel{id: id, key: key, kind: kind, events: set})
+	}
+	if err := channels.Close(); err != nil {
+		return nil, err
+	}
+	if err := channels.Err(); err != nil {
+		return nil, err
+	}
+
+	var pending []PendingNotification
+	for _, ch := range configured {
+		rows, err := s.DB.QueryContext(ctx, `select e.event_id, e.event_type, coalesce(d.attempt_seq, 0),
+				coalesce(sess.session_key, runsess.session_key, ''),
+				coalesce(sess.title, runsess.title, ''),
+				coalesce(sw.workspace_key, rw.workspace_key, ''),
+				coalesce(sp.display_name, rp.display_name, ''),
+				e.payload_json
+			from events e
+			left join notification_deliveries d on d.event_id=e.event_id and d.notification_channel_id=?
+			left join status_subjects subj on subj.status_subject_id=e.status_subject_id
+			left join agent_sessions sess on subj.subject_hash='Session:' || sess.session_id
+			left join agent_runs run on subj.subject_hash='Run:' || run.run_id
+			left join agent_sessions runsess on runsess.session_id=run.session_id
+			left join workspaces sw on sw.workspace_id=sess.workspace_id
+			left join workspaces rw on rw.workspace_id=runsess.workspace_id
+			left join agent_profile_revisions srev on srev.profile_revision_id=sess.profile_revision_id
+			left join agent_providers sp on sp.provider_id=srev.provider_id
+			left join agent_profile_revisions rrev on rrev.profile_revision_id=runsess.profile_revision_id
+			left join agent_providers rp on rp.provider_id=rrev.provider_id
+			where d.delivered_at is null and d.failed_at is null and coalesce(d.attempt_seq, 0) < ?
+			order by e.occurred_at asc`, ch.id, maxAttempts)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var eventID, eventType, sessionKey, title, workspace, providerName, payload string
+			var attemptSeq int
+			if err := rows.Scan(&eventID, &eventType, &attemptSeq, &sessionKey, &title, &workspace, &providerName, &payload); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !ch.events[eventType] {
+				continue
+			}
+			pending = append(pending, PendingNotification{
+				ChannelID: ch.id, ChannelKey: ch.key, ChannelType: ch.kind,
+				EventID: eventID, EventType: eventType, SessionKey: sessionKey,
+				SessionTitle: title, Workspace: workspace, Provider: providerName, Payload: payload,
+				AttemptSeq: attemptSeq + 1,
+			})
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return pending, nil
+}
+
+// RecordNotificationDelivered upserts the delivery row as delivered at attemptSeq.
+func (s *Store) RecordNotificationDelivered(ctx context.Context, channelID, eventID string, attemptSeq int) error {
+	now := Now()
+	_, err := s.DB.ExecContext(ctx, `insert into notification_deliveries(notification_delivery_id, notification_channel_id, event_id, attempt_seq, attempted_at, delivered_at)
+		values(?, ?, ?, ?, ?, ?)
+		on conflict(notification_channel_id, event_id) do update set attempt_seq=excluded.attempt_seq, attempted_at=excluded.attempted_at, delivered_at=excluded.delivered_at, failed_at=null, failure_json=null`,
+		NewID(), channelID, eventID, attemptSeq, now, now)
 	return err
+}
+
+// RecordNotificationFailed upserts the delivery row with the failed attempt.
+// terminal marks the delivery as permanently failed (retry budget exhausted).
+func (s *Store) RecordNotificationFailed(ctx context.Context, channelID, eventID string, attemptSeq int, failureJSON string, terminal bool) error {
+	if !json.Valid([]byte(failureJSON)) {
+		return errors.New("invalid notification failure JSON")
+	}
+	now := Now()
+	// Schema invariant: failure_json is present iff failed_at is present. A
+	// non-terminal (retryable) attempt records neither; only exhaustion sets both.
+	failedAt := any(nil)
+	failure := any(nil)
+	if terminal {
+		failedAt = now
+		failure = failureJSON
+	}
+	_, err := s.DB.ExecContext(ctx, `insert into notification_deliveries(notification_delivery_id, notification_channel_id, event_id, attempt_seq, attempted_at, failed_at, failure_json)
+		values(?, ?, ?, ?, ?, ?, ?)
+		on conflict(notification_channel_id, event_id) do update set attempt_seq=excluded.attempt_seq, attempted_at=excluded.attempted_at, failed_at=excluded.failed_at, failure_json=excluded.failure_json`,
+		NewID(), channelID, eventID, attemptSeq, now, failedAt, failure)
+	return err
+}
+
+// PruneResult reports how many rows each retention sweep removed.
+type PruneResult struct {
+	IdempotencyKeys        int `json:"idempotencyKeys"`
+	NotificationDeliveries int `json:"notificationDeliveries"`
+	CloseAttempts          int `json:"closeAttempts"`
+	SafetyCheckRuns        int `json:"safetyCheckRuns"`
+	OutputChunks           int `json:"outputChunks"`
+	StatusSnapshots        int `json:"statusSnapshots"`
+	Events                 int `json:"events"`
+}
+
+// Prune enforces the configured retention windows, deleting past-retention rows
+// child-before-parent in one serializable transaction, then checkpointing the
+// WAL and running incremental vacuum. Events are append-only in the write path
+// (never mutated in place) but age out per event_retention_days: only events of
+// closed sessions and terminal runs are pruned, so a live run's projection and
+// audit trail are never truncated. Timestamps are ISO-8601 UTC text, so string
+// comparison against a formatted cutoff is correct.
+func (s *Store) Prune(ctx context.Context, retention config.Retention) (PruneResult, error) {
+	now := time.Now().UTC()
+	cutoff := func(days int) string {
+		if days <= 0 {
+			days = 1
+		}
+		return now.AddDate(0, 0, -days).Format("2006-01-02T15:04:05.000Z")
+	}
+	idempCut := cutoff(retention.IdempotencyRetentionDays)
+	eventCut := cutoff(retention.EventRetentionDays)
+	outputCut := cutoff(retention.OutputRetentionDays)
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	defer tx.Rollback()
+
+	var result PruneResult
+	del := func(dst *int, query string, args ...any) error {
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if dst != nil {
+			*dst += int(n)
+		}
+		return nil
+	}
+
+	if err := del(&result.IdempotencyKeys, `delete from idempotency_keys where state='Completed' and completed_at is not null and completed_at < ?`, idempCut); err != nil {
+		return PruneResult{}, err
+	}
+	if err := del(&result.NotificationDeliveries, `delete from notification_deliveries where (delivered_at is not null and delivered_at < ?) or (failed_at is not null and failed_at < ?)`, idempCut, idempCut); err != nil {
+		return PruneResult{}, err
+	}
+	// close_blockers (child) before close_attempts (parent). A close_attempt that
+	// still backs a closing_worktrees teardown row is live state and must not be
+	// pruned (its FK child would otherwise abort the whole sweep).
+	if err := del(nil, `delete from close_blockers where close_attempt_id in (
+		select close_attempt_id from close_attempts
+		where coalesce(completed_at, failed_at) is not null and coalesce(completed_at, failed_at) < ?
+			and close_attempt_id not in (select close_attempt_id from closing_worktrees))`, eventCut); err != nil {
+		return PruneResult{}, err
+	}
+	if err := del(&result.CloseAttempts, `delete from close_attempts
+		where coalesce(completed_at, failed_at) is not null and coalesce(completed_at, failed_at) < ?
+			and close_attempt_id not in (select close_attempt_id from closing_worktrees)`, eventCut); err != nil {
+		return PruneResult{}, err
+	}
+	// safety_check_findings (child) before safety_check_runs (parent).
+	if err := del(nil, `delete from safety_check_findings where safety_check_run_id in (
+		select safety_check_run_id from safety_check_runs where coalesce(completed_at, failed_at) is not null and coalesce(completed_at, failed_at) < ?)`, eventCut); err != nil {
+		return PruneResult{}, err
+	}
+	if err := del(&result.SafetyCheckRuns, `delete from safety_check_runs where coalesce(completed_at, failed_at) is not null and coalesce(completed_at, failed_at) < ?`, eventCut); err != nil {
+		return PruneResult{}, err
+	}
+	// Output chunks for closed sessions past the output window.
+	if err := del(&result.OutputChunks, `delete from runner_output_chunks where captured_at < ? and run_id in (
+		select r.run_id from agent_runs r join agent_sessions s on s.session_id=r.session_id where s.closed_at is not null)`, outputCut); err != nil {
+		return PruneResult{}, err
+	}
+	// Events past event_retention_days for closed sessions and terminal runs.
+	// Excludes any event still referenced by a notification delivery or named as
+	// another event's causation parent, so neither foreign key can abort the
+	// sweep; a parent kept this round ages out once its referrers are gone.
+	if err := del(&result.Events, `delete from events
+		where occurred_at < ?
+			and event_id not in (select event_id from notification_deliveries)
+			and event_id not in (select causation_event_id from events where causation_event_id is not null)
+			and status_subject_id in (
+				select subject.status_subject_id from status_subjects subject
+				join agent_runs r on subject.subject_hash = 'Run:' || r.run_id
+				join run_terminal_outcomes o on o.run_id = r.run_id
+				union
+				select subject.status_subject_id from status_subjects subject
+				join agent_sessions ses on subject.subject_hash = 'Session:' || ses.session_id
+				where ses.closed_at is not null)`, eventCut); err != nil {
+		return PruneResult{}, err
+	}
+	// Historical status snapshots beyond the per-subject retention window.
+	// status_snapshot_window is a COUNT (keep the newest N per subject), not a
+	// time span, so this is windowed by row_number, not by a captured_at cut. The
+	// authoritative latest snapshot is always retained regardless of the window.
+	snapshotWindow := retention.StatusSnapshotWindow
+	if snapshotWindow < 0 {
+		snapshotWindow = 0
+	}
+	if err := del(&result.StatusSnapshots, `delete from status_snapshots
+		where status_snapshot_id not in (select status_snapshot_id from latest_status_snapshots)
+			and status_snapshot_id in (
+				select status_snapshot_id from (
+					select status_snapshot_id,
+						row_number() over (partition by status_subject_id order by captured_at desc, status_snapshot_id desc) rn
+					from status_snapshots
+				) where rn > ?)`, snapshotWindow); err != nil {
+		return PruneResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PruneResult{}, err
+	}
+
+	if _, err := s.DB.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return PruneResult{}, err
+	}
+	if _, err := s.DB.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+		return PruneResult{}, err
+	}
+	return result, nil
 }
 
 func fmtRun(seq int) string {
@@ -2507,7 +3050,7 @@ func runStatusFromOutcome(outcome string) string {
 	}
 }
 
-func deriveRunStatus(closedAt, outcome, snapshot sql.NullString, live bool, heartbeatAt, boundAt, outputAt sql.NullString) string {
+func deriveRunStatus(quietThreshold time.Duration, closedAt, outcome, snapshot sql.NullString, live bool, heartbeatAt, boundAt, outputAt sql.NullString) string {
 	if closedAt.Valid {
 		return "Closed"
 	}
@@ -2517,9 +3060,10 @@ func deriveRunStatus(closedAt, outcome, snapshot sql.NullString, live bool, hear
 	if snapshot.Valid && runStatusFromSnapshot(snapshot.String) == "RepairRequired" {
 		return "RepairRequired"
 	}
-	if live && staleTimestamp(heartbeatAt, heartbeatTTL) {
-		return "LostRunner"
-	}
+	// LostRunner is decided by the supervisor on the monotonic clock, not here;
+	// see supervisor.listSessions. The store treats a live binding as
+	// Live/Quiet and lets the supervisor override to LostRunner when the
+	// monotonic heartbeat TTL has elapsed.
 	if snapshot.Valid {
 		return runStatusFromSnapshot(snapshot.String)
 	}
@@ -2630,7 +3174,10 @@ func publicEventSubject(subjectHash, sessionID, sessionHandle string, runHandles
 	if runID, ok := strings.CutPrefix(subjectHash, "Run:"); ok {
 		return map[string]any{"kind": "Run", "session": sessionHandle, "run": runHandles[runID]}
 	}
-	return map[string]any{"kind": "Subject"}
+	// ListSessionEvents only ever joins Session and Run subjects, so reaching
+	// here means a non-session/run subject leaked into a session's event stream:
+	// a broken invariant, not a value to paper over with a non-canonical kind.
+	panic("publicEventSubject: unexpected subject hash " + subjectHash)
 }
 
 func insertRunStatusSnapshot(ctx context.Context, tx *sql.Tx, runID, source, snapshotJSON string) error {
@@ -2743,7 +3290,7 @@ func insertRunEvent(ctx context.Context, tx *sql.Tx, runID, eventType, payloadJS
 	if err != nil {
 		return err
 	}
-	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"Supervisor"}`, payloadJSON)
+	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"Supervisor"}`, payloadJSON, runID, "")
 }
 
 func ensureRunSubject(ctx context.Context, tx *sql.Tx, runID string) (string, error) {
@@ -2828,7 +3375,7 @@ func insertWorkspaceEvent(ctx context.Context, tx *sql.Tx, workspaceID, eventTyp
 	if err != nil {
 		return err
 	}
-	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"User"}`, payloadJSON)
+	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"User"}`, payloadJSON, workspaceID, "")
 }
 
 func insertSessionEvent(ctx context.Context, tx *sql.Tx, sessionID, eventType, payloadJSON string) error {
@@ -2836,15 +3383,22 @@ func insertSessionEvent(ctx context.Context, tx *sql.Tx, sessionID, eventType, p
 	if err != nil {
 		return err
 	}
-	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"User"}`, payloadJSON)
+	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"User"}`, payloadJSON, sessionID, "")
 }
 
-func insertEvent(ctx context.Context, tx *sql.Tx, subjectID, eventType, actorJSON, payloadJSON string) error {
+// insertEvent appends an event. correlationID ties an entity's events together
+// (its run/session/workspace/host id) so a request can be traced across lines in
+// both the event log and the operational log; causationEventID (optional) links
+// an effect event to the event that caused it.
+func insertEvent(ctx context.Context, tx *sql.Tx, subjectID, eventType, actorJSON, payloadJSON, correlationID, causationEventID string) error {
 	if !eventlog.Valid(eventType) {
 		return errors.New("unknown event type: " + eventType)
 	}
 	if !json.Valid([]byte(actorJSON)) || !json.Valid([]byte(payloadJSON)) {
 		return errors.New("invalid event JSON")
+	}
+	if correlationID == "" {
+		correlationID = subjectID
 	}
 	eventID := NewID()
 	now := Now()
@@ -2852,54 +3406,40 @@ func insertEvent(ctx context.Context, tx *sql.Tx, subjectID, eventType, actorJSO
 	if err := tx.QueryRowContext(ctx, `select coalesce(max(event_seq), 0)+1 from events where status_subject_id=?`, subjectID).Scan(&eventSeq); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `insert into events(event_id, status_subject_id, event_seq, occurred_at, event_type, actor_json, payload_json, correlation_json)
-		values(?, ?, ?, ?, ?, ?, ?, '{}')`, eventID, subjectID, eventSeq, now, eventType, actorJSON, payloadJSON); err != nil {
-		return err
+	var causation any
+	if causationEventID != "" {
+		causation = causationEventID
 	}
-	return recordNotificationDeliveries(ctx, tx, eventID, eventType, now)
+	// Notification delivery is intentionally NOT performed here. It is decoupled
+	// from the state-mutating transaction and driven asynchronously by the
+	// notification worker (see PendingNotifications), so a delivery failure can
+	// never roll back canonical run state.
+	_, err := tx.ExecContext(ctx, `insert into events(event_id, status_subject_id, event_seq, occurred_at, event_type, actor_json, payload_json, correlation_json, causation_event_id)
+		values(?, ?, ?, ?, ?, ?, ?, ?, ?)`, eventID, subjectID, eventSeq, now, eventType, actorJSON, payloadJSON, `{"correlationId":`+quoteJSON(correlationID)+`}`, causation)
+	return err
 }
 
-func recordNotificationDeliveries(ctx context.Context, tx *sql.Tx, eventID, eventType, now string) error {
-	rows, err := tx.QueryContext(ctx, `select notification_channel_id, channel_type, channel_spec_json from notification_channels where disabled_at is null`)
+// latestRunEventID returns the most recent event id of a type on a run subject,
+// used to link an effect event to its cause (causation).
+func latestRunEventID(ctx context.Context, tx *sql.Tx, runID, eventType string) (string, bool, error) {
+	var id string
+	err := tx.QueryRowContext(ctx, `select e.event_id from events e
+		join status_subjects s on s.status_subject_id=e.status_subject_id
+		where s.subject_hash='Run:'||? and e.event_type=?
+		order by e.event_seq desc limit 1`, runID, eventType).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return id, err == nil, err
+}
+
+// insertRunEventCaused appends a run event linked to the event that caused it.
+func insertRunEventCaused(ctx context.Context, tx *sql.Tx, runID, eventType, payloadJSON, causationEventID string) error {
+	subjectID, err := ensureRunSubject(ctx, tx, runID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var channelID, channelType, rawSpec string
-		if err := rows.Scan(&channelID, &channelType, &rawSpec); err != nil {
-			return err
-		}
-		var spec struct {
-			Events []string `json:"events"`
-		}
-		if err := json.Unmarshal([]byte(rawSpec), &spec); err != nil {
-			return err
-		}
-		selected := false
-		for _, selectedEvent := range spec.Events {
-			if selectedEvent == eventType {
-				selected = true
-				break
-			}
-		}
-		if !selected {
-			continue
-		}
-		deliveredAt := now
-		failedAt := any(nil)
-		failureJSON := any(nil)
-		if channelType != "Terminal" {
-			deliveredAt = ""
-			failedAt = now
-			failureJSON = `{"code":"UnsupportedNotificationChannel"}`
-		}
-		if _, err := tx.ExecContext(ctx, `insert into notification_deliveries(notification_delivery_id, notification_channel_id, event_id, attempt_seq, attempted_at, delivered_at, failed_at, failure_json)
-			values(?, ?, ?, 1, ?, nullif(?, ''), ?, ?) on conflict(notification_channel_id, event_id) do nothing`, NewID(), channelID, eventID, now, deliveredAt, failedAt, failureJSON); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
+	return insertEvent(ctx, tx, subjectID, eventType, `{"kind":"Supervisor"}`, payloadJSON, runID, causationEventID)
 }
 
 func ensureSessionSubject(ctx context.Context, tx *sql.Tx, sessionID string) (string, error) {
@@ -2942,9 +3482,24 @@ func readWorkspaceSubject(ctx context.Context, tx *sql.Tx, workspaceID string) (
 	return subjectID, err == nil, err
 }
 
+// ensureTmuxServerSubject returns the Host status subject for the host that owns
+// the named tmux server. A tmux-server-restart event is a fact about that host;
+// StatusSubjectKind has no TmuxServer member (canonical kinds are Session, Run,
+// Workspace, Host), so the event attaches to the Host subject.
 func ensureTmuxServerSubject(ctx context.Context, tx *sql.Tx, key string) (string, error) {
+	var hostID string
+	if err := tx.QueryRowContext(ctx, `select host_id from tmux_servers where tmux_server_key=? and retired_at is null`, key).Scan(&hostID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errors.New("TmuxServerNotFound")
+		}
+		return "", err
+	}
+	return ensureHostSubject(ctx, tx, hostID)
+}
+
+func ensureHostSubject(ctx context.Context, tx *sql.Tx, hostID string) (string, error) {
 	var subjectID string
-	err := tx.QueryRowContext(ctx, `select status_subject_id from status_subjects where subject_hash=?`, "TmuxServer:"+key).Scan(&subjectID)
+	err := tx.QueryRowContext(ctx, `select status_subject_id from status_subjects where subject_hash=?`, "Host:"+hostID).Scan(&subjectID)
 	if err == nil {
 		return subjectID, nil
 	}
@@ -2953,6 +3508,6 @@ func ensureTmuxServerSubject(ctx context.Context, tx *sql.Tx, key string) (strin
 	}
 	subjectID = NewID()
 	_, err = tx.ExecContext(ctx, `insert into status_subjects(status_subject_id, subject_json, subject_hash, created_at)
-		values(?, ?, ?, ?)`, subjectID, `{"kind":"TmuxServer","tmuxServer":`+quoteJSON(key)+`}`, "TmuxServer:"+key, Now())
+		values(?, ?, ?, ?)`, subjectID, `{"kind":"Host","hostId":"`+hostID+`"}`, "Host:"+hostID, Now())
 	return subjectID, err
 }

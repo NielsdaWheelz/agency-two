@@ -22,7 +22,15 @@ import (
 
 const BinaryVersion = "dev"
 
-const heartbeatInterval = 2 * time.Second
+// defaultHeartbeatInterval is the fallback runner→supervisor heartbeat cadence
+// used when the supervisor does not pass -heartbeat-interval-ms. The supervisor
+// owns the effective value from [timing].heartbeat_interval_ms and must keep it
+// well under heartbeat_ttl_ms so a single missed beat never trips liveness.
+const defaultHeartbeatInterval = 2 * time.Second
+
+// outputDrainGrace bounds how long run() waits for the PTY reader to finish
+// draining after the child exits before it announces the terminal outcome.
+const outputDrainGrace = 2 * time.Second
 
 type Config struct {
 	RunID         string
@@ -33,8 +41,11 @@ type Config struct {
 	Env           []string
 	EnvFile       string
 	Dir           string
-	Stdout        io.Writer
-	Stderr        io.Writer
+	// HeartbeatInterval is the config-owned heartbeat cadence supplied by the
+	// supervisor (-heartbeat-interval-ms). Zero selects defaultHeartbeatInterval.
+	HeartbeatInterval time.Duration
+	Stdout            io.Writer
+	Stderr            io.Writer
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -65,6 +76,9 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 	if cfg.SpoolPath == "" {
 		cfg.SpoolPath = cfg.SocketPath + ".output"
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = defaultHeartbeatInterval
 	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = io.Discard
@@ -111,17 +125,27 @@ func Serve(ctx context.Context, cfg Config) error {
 
 	exited := make(chan runnerproto.Termination, 1)
 	server := &server{
-		cfg:      cfg,
-		listener: ln,
-		child:    child,
-		spool:    spool,
-		exited:   exited,
-		done:     serveCtx.Done(),
+		cfg:          cfg,
+		listener:     ln,
+		child:        child,
+		spool:        spool,
+		exited:       exited,
+		done:         serveCtx.Done(),
+		captureDone:  make(chan struct{}),
+		clients:      map[*client]struct{}{},
+		inputSeqs:    map[int64]struct{}{},
+		nextChunkSeq: 1,
 	}
+	// captureOutput touches s.clients/s.nextChunkSeq under s.mu, so those fields
+	// must be initialized before it starts (above), not inside run().
 	go server.captureOutput()
 	go func() {
+		// The channel is buffered, so this send never blocks even if run() has
+		// already returned; do not cancel here — letting run() observe the exit
+		// deterministically is what guarantees Exit is broadcast (a cancel would
+		// race the exit against the done branch and could drop the terminal
+		// outcome).
 		exited <- child.wait()
-		cancel()
 	}()
 	return server.run()
 }
@@ -235,12 +259,13 @@ func (c *childProcess) closePTY() {
 }
 
 type server struct {
-	cfg      Config
-	listener net.Listener
-	child    *childProcess
-	spool    *os.File
-	exited   <-chan runnerproto.Termination
-	done     <-chan struct{}
+	cfg         Config
+	listener    net.Listener
+	child       *childProcess
+	spool       *os.File
+	exited      <-chan runnerproto.Termination
+	done        <-chan struct{}
+	captureDone chan struct{}
 
 	mu           sync.Mutex
 	clients      map[*client]struct{}
@@ -265,9 +290,8 @@ type client struct {
 }
 
 func (s *server) run() error {
-	s.clients = map[*client]struct{}{}
-	s.nextChunkSeq = 1
-	heartbeat := time.NewTicker(heartbeatInterval)
+	defer s.closeClients()
+	heartbeat := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer heartbeat.Stop()
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -287,6 +311,11 @@ func (s *server) run() error {
 		select {
 		case termination := <-s.exited:
 			s.setTermination(termination)
+			// Drain the PTY before announcing Exit so trailing output chunks
+			// reach subscribers ahead of the terminal frame; the supervisor
+			// stops reading once it sees Exit and will not reconnect to a
+			// terminal run, so any chunk emitted after Exit would be lost.
+			s.drainOutput()
 			s.broadcastExit(termination)
 			return nil
 		case err := <-acceptErr:
@@ -304,7 +333,32 @@ func (s *server) run() error {
 	}
 }
 
+// drainOutput waits for captureOutput to finish reading the PTY (which happens
+// promptly once the child exits and the PTY reports EIO), bounded by a grace
+// window so a wedged read can never hang terminal reporting.
+func (s *server) drainOutput() {
+	select {
+	case <-s.captureDone:
+	case <-time.After(outputDrainGrace):
+	}
+}
+
+// closeClients closes every accepted connection so handle goroutines unblock
+// and exit when the server stops.
+func (s *server) closeClients() {
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+	for _, c := range clients {
+		_ = c.conn.Close()
+	}
+}
+
 func (s *server) captureOutput() {
+	defer close(s.captureDone)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := s.child.pty.Read(buf)
@@ -423,7 +477,7 @@ func (s *server) currentTermination() *runnerproto.Termination {
 	return &termination
 }
 
-func (s *server) broadcast(msg any) {
+func (s *server) broadcastHeartbeat() {
 	s.mu.Lock()
 	clients := make([]*client, 0, len(s.clients))
 	for c := range s.clients {
@@ -431,21 +485,8 @@ func (s *server) broadcast(msg any) {
 	}
 	s.mu.Unlock()
 
-	for _, c := range clients {
-		_ = c.write(msg)
-	}
-}
-
-func (s *server) broadcastHeartbeat() {
-	s.mu.Lock()
-	clients := make([]*client, 0, len(s.clients))
-	for c := range s.clients {
-		if c.isSubscribed() {
-			clients = append(clients, c)
-		}
-	}
-	s.mu.Unlock()
-
+	// Heartbeats go to every connected client, not just output subscribers:
+	// liveness is independent of whether a client is tailing output.
 	for _, c := range clients {
 		_ = c.write(runnerproto.NewHeartbeat(s.cfg.RunID))
 	}
@@ -563,6 +604,8 @@ func parseArgs(args []string, stdout, stderr io.Writer) (Config, error) {
 	fs.StringVar(&cfg.BinaryVersion, "runner-binary-version", BinaryVersion, "runner binary version")
 	fs.StringVar(&cfg.Dir, "cwd", "", "child working directory")
 	fs.StringVar(&cfg.EnvFile, "env-file", "", "file with child environment entries")
+	var heartbeatIntervalMs int
+	fs.IntVar(&heartbeatIntervalMs, "heartbeat-interval-ms", 0, "runner heartbeat cadence in milliseconds")
 	fs.Func("env", "", func(value string) error {
 		if err := validateEnv(value); err != nil {
 			return err
@@ -573,6 +616,10 @@ func parseArgs(args []string, stdout, stderr io.Writer) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	if heartbeatIntervalMs < 0 {
+		return Config{}, errors.New("-heartbeat-interval-ms must not be negative")
+	}
+	cfg.HeartbeatInterval = time.Duration(heartbeatIntervalMs) * time.Millisecond
 	cfg.Command = fs.Args()
 	if len(cfg.Command) > 0 && cfg.Command[0] == "--" {
 		cfg.Command = cfg.Command[1:]
@@ -613,9 +660,16 @@ func loadEnvFile(path string) ([]string, error) {
 }
 
 func validateEnv(value string) error {
+	// Never include the value in an error: it may carry a provider credential.
 	name, _, ok := strings.Cut(value, "=")
-	if !ok || name == "" || strings.ContainsAny(value, "\x00\n\r") {
-		return fmt.Errorf("invalid environment assignment %q", value)
+	if !ok {
+		return errors.New("invalid environment assignment: expected NAME=VALUE")
+	}
+	if name == "" {
+		return errors.New("invalid environment assignment: empty variable name")
+	}
+	if strings.ContainsAny(value, "\x00\n\r") {
+		return fmt.Errorf("invalid environment assignment for %q: contains control characters", name)
 	}
 	return nil
 }

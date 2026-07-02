@@ -3,23 +3,30 @@ package supervisor
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	"agency-two/internal/agency/config"
 	"agency-two/internal/agency/gitx"
+	"agency-two/internal/agency/logging"
 	"agency-two/internal/agency/provider"
 	"agency-two/internal/agency/runnerproto"
 	"agency-two/internal/agency/safety"
@@ -30,16 +37,35 @@ import (
 const Version = "dev"
 
 const (
-	reconcileInterval = 30 * time.Second
+	// Defaults for the timing parameters the configuration service owns
+	// (heartbeat_ttl_ms, reconcile_interval_ms, graceful_stop_timeout_ms). They
+	// are applied in open when config leaves them zero, so tests and config can
+	// inject their own values.
+	defaultHeartbeatTTL        = 10 * time.Second
+	defaultReconcileInterval   = 15 * time.Second
+	defaultGracefulStopTimeout = 10 * time.Second
+
 	runnerDialTimeout = 300 * time.Millisecond
-	runnerOrphanTTL   = 30 * time.Second
 	outputRetryDelay  = 250 * time.Millisecond
+	// compactionInterval is the background retention-sweep cadence.
+	compactionInterval = time.Hour
+	// promptDetectionInterval is how often the rendered pane is inspected for a
+	// prompt state per live run.
+	promptDetectionInterval = time.Second
 )
 
 type Config struct {
 	StateDB    string
 	SocketPath string
 	LockPath   string
+	// HeartbeatTTL and ReconcileInterval are owned by the configuration service
+	// (heartbeat_ttl_ms, reconcile_interval_ms). Zero selects the default.
+	HeartbeatTTL      time.Duration
+	ReconcileInterval time.Duration
+	// TCPTunnelAddr, when set, additionally serves the API over an authenticated
+	// loopback TCP tunnel at this address (bearer token required). Empty disables
+	// it; the Unix socket is always the primary transport.
+	TCPTunnelAddr string
 }
 
 type Health struct {
@@ -54,11 +80,20 @@ type Health struct {
 	QuarantinedRunners    int    `json:"quarantinedRunners"`
 	OrphanedRunners       int    `json:"orphanedRunners"`
 	LastReconcileAt       string `json:"lastReconcileAt"`
+	WALSizeBytes          int64  `json:"walSizeBytes"`
+	ClockBaseline         string `json:"clockBaseline"`
+}
+
+type GoroutineDump struct {
+	Goroutines string `json:"goroutines"`
 }
 
 type request struct {
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params,omitempty"`
+	// Token authenticates a loopback TCP tunnel client (unused on the Unix
+	// socket, which authenticates by peer credential).
+	Token string `json:"token,omitempty"`
 }
 
 type response struct {
@@ -360,9 +395,16 @@ type CloseTerminalSessionsParams struct {
 
 type Server struct {
 	cfg     Config
+	config  config.Config
 	started time.Time
 	store   *storage.Store
+	log     *logging.Logger
+	logDir  string
 	lock    *os.File
+
+	heartbeatTTL        time.Duration
+	reconcileInterval   time.Duration
+	gracefulStopTimeout time.Duration
 
 	mu                  sync.Mutex
 	adoptedRunners      int
@@ -370,6 +412,23 @@ type Server struct {
 	orphanedRunners     int
 	lastReconcileAt     string
 	outputSubscriptions map[string]context.CancelFunc
+	// runnerHeartbeats records, per run, the supervisor's monotonic clock
+	// reading at the last observed heartbeat or adoption. Liveness is evaluated
+	// against this monotonic baseline, never against the persisted wall-clock
+	// last_heartbeat_at, so a supervisor restart or a suspend/resume (which
+	// CLOCK_MONOTONIC does not advance across) can never expire a live runner
+	// from a stale wall-clock delta. A run absent from this map is unproven in
+	// this process lifetime and is given one fresh TTL window from start.
+	runnerHeartbeats map[string]time.Time
+
+	// locks serializes contending mutations on shared conflict keys.
+	locks *keyedLocks
+	// tunnelToken authenticates loopback TCP tunnel clients (empty when the
+	// tunnel is disabled).
+	tunnelToken string
+	// reportedOrphans dedupes adoptable-orphan DoctorIssueObserved events so a
+	// standing orphan is reported once per supervisor lifetime, not every pass.
+	reportedOrphans map[string]bool
 }
 
 func Serve(ctx context.Context, cfg Config) error {
@@ -382,7 +441,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(cfg.SocketPath), 0700); err != nil {
+	if err := assertPrivateSocketDir(filepath.Dir(cfg.SocketPath)); err != nil {
 		return err
 	}
 	if err := removeStaleSocket(cfg.SocketPath); err != nil {
@@ -398,8 +457,23 @@ func Serve(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	server.log.Info("supervisor started",
+		"version", Version, "runnerProtocolVersion", runnerproto.ProtocolVersion,
+		"dbPath", cfg.StateDB, "socket", cfg.SocketPath,
+		"heartbeatTtlMs", server.heartbeatTTL.Milliseconds(), "reconcileIntervalMs", server.reconcileInterval.Milliseconds())
+
 	errs := make(chan error, 1)
+	if cfg.TCPTunnelAddr != "" {
+		stopTunnel, err := server.startTunnel(ctx, errs)
+		if err != nil {
+			return err
+		}
+		defer stopTunnel()
+	}
 	go server.reconcileLoop(ctx)
+	go server.compactionLoop(ctx)
+	go server.notificationLoop(ctx)
+	go server.promptDetectionLoop(ctx)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -424,12 +498,117 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 }
 
+// startTunnel binds the authenticated loopback TCP tunnel, mints a per-supervisor
+// bearer token, and writes the token and chosen address to 0600 files in the
+// runtime directory for local clients. It enforces loopback binding when the
+// config requires it. The token is verified on every tunnel connection before
+// dispatch (see handle).
+func (s *Server) startTunnel(ctx context.Context, errs chan error) (func(), error) {
+	addr := s.cfg.TCPTunnelAddr
+	if s.config.Security.TCPTunnelLoopbackOnly {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("tcp tunnel address %q: %w", addr, err)
+		}
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("tcp tunnel address %q is not loopback", addr)
+		}
+	}
+	token, err := mintTunnelToken()
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s.tunnelToken = token
+	runtimeDir := filepath.Dir(s.cfg.SocketPath)
+	if err := os.WriteFile(filepath.Join(runtimeDir, "tunnel.token"), []byte(token), 0600); err != nil {
+		listener.Close()
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "tunnel.addr"), []byte(listener.Addr().String()), 0600); err != nil {
+		listener.Close()
+		return nil, err
+	}
+	s.log.Info("tcp tunnel listening", "addr", listener.Addr().String())
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+				default:
+					errs <- err
+				}
+				return
+			}
+			go s.handle(conn)
+		}
+	}()
+	return func() {
+		listener.Close()
+		_ = os.Remove(filepath.Join(runtimeDir, "tunnel.token"))
+		_ = os.Remove(filepath.Join(runtimeDir, "tunnel.addr"))
+	}, nil
+}
+
+func mintTunnelToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+// CallTCP invokes a supervisor method over the authenticated loopback TCP tunnel,
+// presenting the bearer token. Used by remote clients whose Unix socket is not
+// directly reachable.
+func CallTCP(ctx context.Context, addr, token, method string, params any, result any) error {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var rawParams json.RawMessage
+	if params != nil {
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return err
+		}
+		rawParams = encoded
+	}
+	if err := json.NewEncoder(conn).Encode(request{Method: method, Params: rawParams, Token: token}); err != nil {
+		return err
+	}
+	var resp response
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+	if result == nil {
+		return nil
+	}
+	return json.Unmarshal(resp.Result, result)
+}
+
 func HealthCheck(ctx context.Context, socketPath string) (Health, error) {
 	var health Health
 	if err := Call(ctx, socketPath, "health", nil, &health); err != nil {
 		return Health{}, err
 	}
 	return health, nil
+}
+
+func GoroutineDumpText(ctx context.Context, socketPath string) (string, error) {
+	var dump GoroutineDump
+	if err := Call(ctx, socketPath, "goroutineDump", nil, &dump); err != nil {
+		return "", err
+	}
+	return dump.Goroutines, nil
 }
 
 func ListSessions(ctx context.Context, socketPath string) ([]storage.SessionSummary, error) {
@@ -652,8 +831,12 @@ func Doctor(ctx context.Context, socketPath string) (DoctorReport, error) {
 	return result, nil
 }
 
-func Prune(ctx context.Context, socketPath string) error {
-	return Call(ctx, socketPath, "prune", nil, nil)
+func Prune(ctx context.Context, socketPath string) (storage.PruneResult, error) {
+	var result storage.PruneResult
+	if err := Call(ctx, socketPath, "prune", nil, &result); err != nil {
+		return storage.PruneResult{}, err
+	}
+	return result, nil
 }
 
 func Export(ctx context.Context, socketPath, path string) (ExportResult, error) {
@@ -740,8 +923,150 @@ func open(ctx context.Context, cfg Config) (*Server, error) {
 		lock.Close()
 		return nil, err
 	}
-	return &Server{cfg: cfg, started: time.Now(), store: store, lock: lock, outputSubscriptions: map[string]context.CancelFunc{}}, nil
+	// Parse the TOML configuration once at ingress; runtime timing comes from it.
+	loaded, err := config.Load(config.DiscoverSources(filepath.Dir(cfg.StateDB)))
+	if err != nil {
+		store.Close()
+		lock.Close()
+		return nil, err
+	}
+	// Config.HeartbeatTTL/ReconcileInterval are test/host injection overrides;
+	// otherwise the parsed config (which defaults to the schema values) wins.
+	heartbeatTTL := cfg.HeartbeatTTL
+	if heartbeatTTL <= 0 {
+		heartbeatTTL = time.Duration(loaded.Timing.HeartbeatTTLMs) * time.Millisecond
+	}
+	if heartbeatTTL <= 0 {
+		heartbeatTTL = defaultHeartbeatTTL
+	}
+	reconcileInterval := cfg.ReconcileInterval
+	if reconcileInterval <= 0 {
+		reconcileInterval = time.Duration(loaded.Timing.ReconcileIntervalMs) * time.Millisecond
+	}
+	if reconcileInterval <= 0 {
+		reconcileInterval = defaultReconcileInterval
+	}
+	// The Live/Quiet split is owned by the storage projection; hand it the
+	// config-owned silence bound so no timing literal is stranded in the store.
+	store.SetQuietThreshold(time.Duration(loaded.Timing.QuietThresholdMs) * time.Millisecond)
+	// Config is authoritative for notification channels; sync it so a configured
+	// Desktop channel is deliverable and dropped channels stop delivering.
+	if err := store.SyncNotificationChannels(ctx, loaded.Notifications); err != nil {
+		store.Close()
+		lock.Close()
+		return nil, err
+	}
+	gracefulStopTimeout := time.Duration(loaded.Timing.GracefulStopTimeoutMs) * time.Millisecond
+	if gracefulStopTimeout <= 0 {
+		gracefulStopTimeout = defaultGracefulStopTimeout
+	}
+	logDir := loaded.Paths.LogDir
+	if logDir == "" {
+		logDir = filepath.Join(filepath.Dir(cfg.StateDB), "logs")
+	}
+	logger, err := logging.New(logDir, logging.Options{Level: slog.LevelInfo})
+	if err != nil {
+		store.Close()
+		lock.Close()
+		return nil, err
+	}
+	return &Server{
+		cfg:                 cfg,
+		config:              loaded,
+		started:             time.Now(),
+		store:               store,
+		log:                 logger,
+		logDir:              logDir,
+		lock:                lock,
+		heartbeatTTL:        heartbeatTTL,
+		reconcileInterval:   reconcileInterval,
+		gracefulStopTimeout: gracefulStopTimeout,
+		outputSubscriptions: map[string]context.CancelFunc{},
+		runnerHeartbeats:    map[string]time.Time{},
+		locks:               newKeyedLocks(),
+		reportedOrphans:     map[string]bool{},
+	}, nil
 }
+
+// recordRunnerAlive stamps the monotonic clock for a run's last proven
+// liveness. Called at adoption, at bind, and on every heartbeat.
+func (s *Server) recordRunnerAlive(runID string) {
+	s.mu.Lock()
+	s.runnerHeartbeats[runID] = time.Now()
+	s.mu.Unlock()
+}
+
+// forgetRunner drops a run's monotonic liveness baseline once it has a terminal
+// outcome, so the map does not grow without bound.
+func (s *Server) forgetRunner(runID string) {
+	s.mu.Lock()
+	delete(s.runnerHeartbeats, runID)
+	s.mu.Unlock()
+}
+
+// runnerLost reports whether an active binding has missed its heartbeat TTL on
+// the monotonic clock. An unproven binding (no observation yet this process
+// lifetime) is granted one fresh TTL window measured from supervisor start.
+func (s *Server) runnerLost(runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	last, ok := s.runnerHeartbeats[runID]
+	if !ok {
+		return time.Since(s.started) >= s.heartbeatTTL
+	}
+	return time.Since(last) >= s.heartbeatTTL
+}
+
+// keyedLocks serializes mutating operations that share a conflict key
+// (session, workspace, or run). It is the in-process realization of the spec's
+// Concurrency Rules; cross-process safety relies on the supervisor singleton, so
+// a second supervisor cannot bypass these keys. Multi-key acquisition uses a
+// stable global (sorted) order, which makes it deadlock-free.
+type keyedLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func newKeyedLocks() *keyedLocks {
+	return &keyedLocks{locks: map[string]*sync.Mutex{}}
+}
+
+func (k *keyedLocks) mutexFor(key string) *sync.Mutex {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	m := k.locks[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		k.locks[key] = m
+	}
+	return m
+}
+
+func (k *keyedLocks) acquire(keys ...string) func() {
+	seen := map[string]bool{}
+	ordered := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	held := make([]*sync.Mutex, len(ordered))
+	for i, key := range ordered {
+		held[i] = k.mutexFor(key)
+		held[i].Lock()
+	}
+	return func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].Unlock()
+		}
+	}
+}
+
+func sessionLockKey(session string) string     { return "session:" + session }
+func workspaceLockKey(workspace string) string { return "workspace:" + workspace }
 
 func (s *Server) close() {
 	s.mu.Lock()
@@ -752,6 +1077,9 @@ func (s *Server) close() {
 	if s.store != nil {
 		_ = s.store.Close()
 	}
+	if s.log != nil {
+		_ = s.log.Close()
+	}
 	if s.lock != nil {
 		_ = unix.Flock(int(s.lock.Fd()), unix.LOCK_UN)
 		_ = s.lock.Close()
@@ -760,14 +1088,26 @@ func (s *Server) close() {
 
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
-	if err := verifyPeer(conn); err != nil {
-		_ = writeResponse(conn, nil, err)
-		return
+	_, isUnix := conn.(*net.UnixConn)
+	// The Unix socket authenticates by peer credential before any bytes are read.
+	if isUnix {
+		if err := verifyPeer(conn); err != nil {
+			_ = writeResponse(conn, nil, err)
+			return
+		}
 	}
 	var req request
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&req); err != nil {
 		_ = writeResponse(conn, nil, err)
 		return
+	}
+	// The loopback TCP tunnel authenticates by bearer token before any dispatch;
+	// "private" network placement is not itself access control.
+	if !isUnix {
+		if s.tunnelToken == "" || subtle.ConstantTimeCompare([]byte(req.Token), []byte(s.tunnelToken)) != 1 {
+			_ = writeResponse(conn, nil, errors.New("supervisor tunnel token mismatch"))
+			return
+		}
 	}
 	switch req.Method {
 	case "health":
@@ -782,13 +1122,32 @@ func (s *Server) handle(conn net.Conn) {
 		orphaned := s.orphanedRunners
 		lastReconcileAt := s.lastReconcileAt
 		s.mu.Unlock()
+		walSize := int64(0)
+		if info, statErr := os.Stat(s.cfg.StateDB + "-wal"); statErr == nil {
+			walSize = info.Size()
+		}
 		_ = writeResponse(conn, Health{
 			Status: "Live", Version: Version, RunnerProtocolVersion: runnerproto.ProtocolVersion,
 			DBPath: s.cfg.StateDB, SocketPath: s.cfg.SocketPath,
 			UptimeMS: time.Since(s.started).Milliseconds(), Sessions: len(sessions),
 			AdoptedRunners: adopted, QuarantinedRunners: quarantined, OrphanedRunners: orphaned,
 			LastReconcileAt: lastReconcileAt,
+			WALSizeBytes:    walSize,
+			ClockBaseline:   s.started.UTC().Format("2006-01-02T15:04:05.000Z"),
 		}, nil)
+	case "goroutineDump":
+		// Guarded (peer-cred verified above) dump of all goroutine stacks for
+		// diagnosing a hung supervisor, especially over a forwarded socket.
+		buf := make([]byte, 1<<20)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				buf = buf[:n]
+				break
+			}
+			buf = make([]byte, 2*len(buf))
+		}
+		_ = writeResponse(conn, GoroutineDump{Goroutines: string(buf)}, nil)
 	case "listSessions":
 		sessions, err := s.listSessions(context.Background())
 		_ = writeResponse(conn, sessions, err)
@@ -825,14 +1184,19 @@ func (s *Server) handle(conn net.Conn) {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
-		_ = writeResponse(conn, nil, s.renameSession(context.Background(), params))
+		release := s.locks.acquire(sessionLockKey(params.Session))
+		renameErr := s.renameSession(context.Background(), params)
+		release()
+		_ = writeResponse(conn, nil, renameErr)
 	case "closeSession":
 		var params CloseSessionParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
+		release := s.locks.acquire(sessionLockKey(params.Session))
 		result, err := s.closeSession(context.Background(), params)
+		release()
 		_ = writeResponse(conn, result, err)
 	case "closeTerminalSessions":
 		var params CloseTerminalSessionsParams
@@ -850,7 +1214,9 @@ func (s *Server) handle(conn net.Conn) {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
+		release := s.locks.acquire(sessionLockKey(params.Session))
 		result, err := s.stopRun(context.Background(), params)
+		release()
 		_ = writeResponse(conn, result, err)
 	case "killRun":
 		var params KillRunParams
@@ -858,7 +1224,9 @@ func (s *Server) handle(conn net.Conn) {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
+		release := s.locks.acquire(sessionLockKey(params.Session))
 		result, err := s.killRun(context.Background(), params.Session)
+		release()
 		_ = writeResponse(conn, result, err)
 	case "sendInput":
 		var params SendInputParams
@@ -866,7 +1234,11 @@ func (s *Server) handle(conn net.Conn) {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
+		// Serialize on the session key so concurrent sends allocate their input
+		// sequence and write to the PTY in the same order (no out-of-order bytes).
+		release := s.locks.acquire(sessionLockKey(params.Session))
 		result, err := s.sendInput(context.Background(), params.Session, params.Input, params.ReplayKey)
+		release()
 		_ = writeResponse(conn, result, err)
 	case "closeWorktree":
 		var params CloseWorktreeParams
@@ -874,7 +1246,9 @@ func (s *Server) handle(conn net.Conn) {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
+		release := s.locks.acquire(workspaceLockKey(params.Workspace))
 		result, err := s.closeWorktree(context.Background(), params)
+		release()
 		_ = writeResponse(conn, result, err)
 	case "startRun":
 		var params StartRunParams
@@ -882,7 +1256,15 @@ func (s *Server) handle(conn net.Conn) {
 			_ = writeResponse(conn, nil, err)
 			return
 		}
+		// A start acquires the session key and the workspace key, so it
+		// serializes with a concurrent worktree close on the same workspace.
+		startKeys := []string{sessionLockKey(params.Session)}
+		if detail, err := s.store.Session(context.Background(), params.Session); err == nil {
+			startKeys = append(startKeys, workspaceLockKey(detail.Summary.Workspace))
+		}
+		release := s.locks.acquire(startKeys...)
 		result, err := s.startRun(context.Background(), params)
+		release()
 		_ = writeResponse(conn, result, err)
 	case "startSession":
 		var params StartSessionParams
@@ -993,7 +1375,13 @@ func (s *Server) handle(conn net.Conn) {
 		result, err := s.doctor(context.Background())
 		_ = writeResponse(conn, result, err)
 	case "prune":
-		_ = writeResponse(conn, nil, s.store.Prune(context.Background()))
+		result, err := s.store.Prune(context.Background(), s.config.Retention)
+		if err == nil {
+			s.log.Info("prune", "idempotencyKeys", result.IdempotencyKeys, "notificationDeliveries", result.NotificationDeliveries,
+				"closeAttempts", result.CloseAttempts, "safetyCheckRuns", result.SafetyCheckRuns,
+				"outputChunks", result.OutputChunks, "statusSnapshots", result.StatusSnapshots)
+		}
+		_ = writeResponse(conn, result, err)
 	case "export":
 		var params ExportParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -1015,15 +1403,42 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) reconcileLoop(ctx context.Context) {
-	ticker := time.NewTicker(reconcileInterval)
+// compactionLoop runs background retention pruning on a fixed cadence, plus the
+// on-demand `agency prune` operation. Append-only and high-churn tables are
+// bounded so a long-lived supervisor does not grow the state database without
+// limit.
+func (s *Server) compactionLoop(ctx context.Context) {
+	ticker := time.NewTicker(compactionInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = s.reconcile(ctx)
+			result, err := s.store.Prune(ctx, s.config.Retention)
+			if err != nil {
+				s.log.Error("background compaction failed", "error", err.Error())
+				continue
+			}
+			s.log.Info("background compaction",
+				"idempotencyKeys", result.IdempotencyKeys, "notificationDeliveries", result.NotificationDeliveries,
+				"closeAttempts", result.CloseAttempts, "safetyCheckRuns", result.SafetyCheckRuns,
+				"outputChunks", result.OutputChunks, "statusSnapshots", result.StatusSnapshots)
+		}
+	}
+}
+
+func (s *Server) reconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.reconcile(ctx); err != nil {
+				s.log.Error("reconcile pass failed", "error", err.Error())
+			}
 		}
 	}
 }
@@ -1043,10 +1458,11 @@ func (s *Server) reconcile(ctx context.Context) error {
 	for _, binding := range bindings {
 		preamble, err := readRunnerPreamble(ctx, binding.EndpointPath)
 		if err != nil {
-			if time.Since(binding.LastHeartbeat) >= runnerOrphanTTL {
+			if s.runnerLost(binding.RunID) {
 				if markErr := s.store.MarkRunnerOrphaned(ctx, binding.RunID, err.Error()); markErr != nil {
 					return markErr
 				}
+				s.forgetRunner(binding.RunID)
 				orphaned++
 			}
 			continue
@@ -1058,7 +1474,7 @@ func (s *Server) reconcile(ctx context.Context) error {
 			quarantined++
 			continue
 		}
-		if preamble.RunnerProtocolVersion != runnerproto.ProtocolVersion {
+		if !runnerproto.SupportedProtocolVersion(preamble.RunnerProtocolVersion) {
 			if err := s.store.MarkRunnerQuarantined(ctx, binding.RunID, preamble.RunnerProtocolVersion, preamble.RunnerBinaryVersion, "runner protocol version is not supported"); err != nil {
 				return err
 			}
@@ -1067,15 +1483,16 @@ func (s *Server) reconcile(ctx context.Context) error {
 		}
 		heartbeat, err := readRunnerHeartbeat(ctx, binding.EndpointPath)
 		if err != nil {
-			if time.Since(binding.LastHeartbeat) >= runnerOrphanTTL {
+			if s.runnerLost(binding.RunID) {
 				if markErr := s.store.MarkRunnerOrphaned(ctx, binding.RunID, err.Error()); markErr != nil {
 					return markErr
 				}
+				s.forgetRunner(binding.RunID)
 				orphaned++
 			}
 			continue
 		}
-		if heartbeat.RunID != binding.RunID || heartbeat.ProtocolVersion != runnerproto.ProtocolVersion {
+		if heartbeat.RunID != binding.RunID || !runnerproto.SupportedProtocolVersion(heartbeat.ProtocolVersion) {
 			if err := s.store.MarkRunnerQuarantined(ctx, binding.RunID, preamble.RunnerProtocolVersion, preamble.RunnerBinaryVersion, "runner heartbeat does not match active binding"); err != nil {
 				return err
 			}
@@ -1085,6 +1502,9 @@ func (s *Server) reconcile(ctx context.Context) error {
 		if err := s.store.MarkRunnerAdopted(ctx, binding.RunID, preamble.RunnerProtocolVersion, preamble.RunnerBinaryVersion); err != nil {
 			return err
 		}
+		// Establish a fresh monotonic liveness baseline: adoption is the "one
+		// fresh heartbeat within the TTL" the restart-unproven binding needed.
+		s.recordRunnerAlive(binding.RunID)
 		s.startOutputSubscription(ctx, binding.RunID, binding.EndpointPath)
 		adopted++
 	}
@@ -1094,10 +1514,116 @@ func (s *Server) reconcile(ctx context.Context) error {
 	s.orphanedRunners = orphaned
 	s.lastReconcileAt = storage.Now()
 	s.mu.Unlock()
+	if adopted > 0 || quarantined > 0 || orphaned > 0 {
+		s.log.Info("reconcile pass", "adopted", adopted, "quarantined", quarantined, "orphaned", orphaned)
+	}
 	if err := s.reconcileUnpublishedManagedWorktrees(ctx); err != nil {
 		return err
 	}
+	if err := s.reconcileZombieRuns(ctx); err != nil {
+		return err
+	}
+	if err := s.reconcileOrphanMarkers(ctx); err != nil {
+		return err
+	}
 	return s.resumeClosingWorktrees(ctx)
+}
+
+// reconcileZombieRuns implements reconciliation step (e): a run with a tmux
+// target but no binding and no terminal outcome, whose start predates a grace
+// window, is re-observed. If its runner socket is unreachable the start is
+// recorded as StartFailed; a reachable socket is left for adoption.
+func (s *Server) reconcileZombieRuns(ctx context.Context) error {
+	grace := 2 * s.heartbeatTTL
+	olderThan := time.Now().UTC().Add(-grace).Format("2006-01-02T15:04:05.000Z")
+	zombies, err := s.store.ZombieRuns(ctx, olderThan)
+	if err != nil {
+		return err
+	}
+	for _, zombie := range zombies {
+		socket := defaultRunnerSocket(zombie.RunID)
+		preamble, err := readRunnerPreamble(ctx, socket)
+		if err != nil {
+			// No reachable runner after grace: the start never produced one.
+			if err := s.store.MarkStartFailed(ctx, zombie.RunID, "run had a tmux target but no reachable runner after reconcile grace"); err != nil {
+				return err
+			}
+			s.log.Info("reconcile marked zombie run StartFailed", "runId", zombie.RunID)
+			continue
+		}
+		if preamble.RunID != zombie.RunID || !runnerproto.SupportedProtocolVersion(preamble.RunnerProtocolVersion) {
+			// A stale/foreign or incompatible runner sits at this socket; this run
+			// never bound a usable runner. Do not adopt someone else's process.
+			if err := s.store.MarkStartFailed(ctx, zombie.RunID, "run had a tmux target but no matching compatible runner after reconcile grace"); err != nil {
+				return err
+			}
+			s.log.Info("reconcile marked zombie run StartFailed", "runId", zombie.RunID, "reason", "runner mismatch")
+			continue
+		}
+		// Rediscovered a live, compatible runner that never got bound (the bind
+		// crashed after the socket appeared): rebind and adopt it in place rather
+		// than failing a run that is actually working.
+		if err := s.store.BindRunner(ctx, zombie.RunID, zombie.TmuxTargetID, socket); err != nil {
+			return err
+		}
+		if err := s.store.MarkRunnerAdopted(ctx, zombie.RunID, preamble.RunnerProtocolVersion, preamble.RunnerBinaryVersion); err != nil {
+			return err
+		}
+		s.recordRunnerAlive(zombie.RunID)
+		s.startOutputSubscription(ctx, zombie.RunID, socket)
+		s.log.Info("reconcile rediscovered and bound zombie runner", "runId", zombie.RunID)
+	}
+	return nil
+}
+
+// reconcileOrphanMarkers implements reconciliation step (d): on-disk agency
+// worktree markers with no managed_worktrees row are adoptable orphans. They are
+// reported (DoctorIssueObserved), never deleted, so user work is preserved.
+func (s *Server) reconcileOrphanMarkers(ctx context.Context) error {
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return err
+	}
+	for _, project := range projects {
+		entries, err := os.ReadDir(project.ManagedWorktreeRoot)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			markerPath := filepath.Join(project.ManagedWorktreeRoot, entry.Name(), ".agency-worktree")
+			raw, err := os.ReadFile(markerPath)
+			if err != nil {
+				continue
+			}
+			workspaceID := strings.TrimSpace(string(raw))
+			exists, err := s.store.ManagedWorkspaceExists(ctx, workspaceID)
+			if err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+			s.mu.Lock()
+			already := s.reportedOrphans[markerPath]
+			s.reportedOrphans[markerPath] = true
+			s.mu.Unlock()
+			if already {
+				continue
+			}
+			payload := `{"issue":"AdoptableOrphanWorktree","path":` + strconv.Quote(filepath.Dir(markerPath)) + `,"markerWorkspaceId":` + strconv.Quote(workspaceID) + `}`
+			if err := s.store.RecordDoctorIssueObserved(ctx, project.HostKey, payload); err != nil {
+				return err
+			}
+			s.log.Warn("adoptable orphan worktree observed", "path", filepath.Dir(markerPath))
+		}
+	}
+	return nil
 }
 
 func (s *Server) reconcileTmuxServer(ctx context.Context) (int, error) {
@@ -1187,6 +1713,17 @@ func (s *Server) reconcileUnpublishedManagedWorktrees(ctx context.Context) error
 				if err := s.store.PublishManagedWorkspace(ctx, wt.WorkspaceID); err != nil {
 					return err
 				}
+				if err := s.store.RecordWorktreeReconciled(ctx, wt.WorkspaceID, "published"); err != nil {
+					return err
+				}
+			} else {
+				// Marker present but its hash does not match: the worktree is
+				// inconsistent. Quarantine it (leave unpublished, surface for
+				// repair) rather than publishing unverified state or deleting it.
+				if err := s.store.RecordWorktreeReconciled(ctx, wt.WorkspaceID, "quarantined-inconsistent"); err != nil {
+					return err
+				}
+				s.log.Info("reconcile quarantined inconsistent managed worktree", "workspaceId", wt.WorkspaceID)
 			}
 			continue
 		}
@@ -1194,6 +1731,9 @@ func (s *Server) reconcileUnpublishedManagedWorktrees(ctx context.Context) error
 			return err
 		}
 		if _, err := os.Stat(wt.Path); os.IsNotExist(err) {
+			if err := s.store.RecordWorktreeReconciled(ctx, wt.WorkspaceID, "discarded-orphan"); err != nil {
+				return err
+			}
 			if err := s.store.DeleteUnpublishedManagedWorkspace(ctx, wt.WorkspaceID); err != nil {
 				return err
 			}
@@ -1212,6 +1752,9 @@ func (s *Server) startOutputSubscription(ctx context.Context, runID, socketPath 
 	}
 	subCtx, cancel := context.WithCancel(ctx)
 	s.outputSubscriptions[runID] = cancel
+	// A freshly bound or adopted runner is proven live now; seed the monotonic
+	// baseline so it is not treated as unproven before its first heartbeat.
+	s.runnerHeartbeats[runID] = time.Now()
 	s.mu.Unlock()
 	go func() {
 		defer func() {
@@ -1264,9 +1807,10 @@ func (s *Server) subscribeRunnerOutput(ctx context.Context, runID, socketPath st
 		}
 		switch m := msg.(type) {
 		case runnerproto.Heartbeat:
-			if m.RunID != runID || m.ProtocolVersion != runnerproto.ProtocolVersion {
+			if m.RunID != runID || !runnerproto.SupportedProtocolVersion(m.ProtocolVersion) {
 				return errors.New("runner heartbeat does not match active binding")
 			}
+			s.recordRunnerAlive(runID)
 			if err := s.store.RecordRunnerHeartbeat(ctx, runID); err != nil {
 				return err
 			}
@@ -1274,17 +1818,18 @@ func (s *Server) subscribeRunnerOutput(ctx context.Context, runID, socketPath st
 			if err := s.store.AppendOutputChunk(ctx, runID, m.ChunkSeq, m.Stream, m.Bytes); err != nil {
 				return err
 			}
-			if status, detail := promptHintFromOutput(m.Bytes); status != "" {
-				if err := s.store.RecordPromptHint(ctx, runID, status, detail); err != nil {
-					return err
-				}
-			}
+			// Prompt-state detection reads the rendered tmux pane, not this raw
+			// PTY chunk (see promptDetectionLoop), so it is not classified here.
 		case runnerproto.Exit:
 			raw, err := json.Marshal(m.Termination)
 			if err != nil {
 				return err
 			}
-			return s.store.RecordTerminalOutcome(ctx, runID, m.Termination.Outcome, string(raw))
+			if err := s.store.RecordTerminalOutcome(ctx, runID, m.Termination.Outcome, string(raw)); err != nil {
+				return err
+			}
+			s.forgetRunner(runID)
+			return nil
 		}
 	}
 }
@@ -1321,6 +1866,14 @@ func (s *Server) listSessions(ctx context.Context) ([]storage.SessionSummary, er
 					sessions[i].Close = map[string]any{"closable": false, "summary": "RepairRequired", "blockers": []string{"TmuxTargetMissing"}}
 				}
 			}
+		}
+		// LostRunner is a monotonic-clock liveness projection owned by the
+		// supervisor (the store never decides it from a persisted wall-clock
+		// delta). An active binding whose heartbeat is stale on the monotonic
+		// clock, and whose tmux target still exists, is a lost runner.
+		if sessions[i].HasActiveBinding && activeSessionStatus(sessions[i].RunStatus) && s.runnerLost(sessions[i].RunID) {
+			sessions[i].RunStatus = "LostRunner"
+			sessions[i].Close = map[string]any{"closable": false, "summary": "RepairRequired", "blockers": []string{"RunnerHeartbeatExpired"}}
 		}
 	}
 	return sessions, nil
@@ -1396,31 +1949,53 @@ func (s *Server) sessionStatus(ctx context.Context, session string) (SessionStat
 	}, nil
 }
 
-func promptHintFromOutput(raw []byte) (string, string) {
-	text := strings.ToLower(string(raw))
-	for _, phrase := range []string{
-		"approval required",
-		"requires approval",
-		"waiting for approval",
-		"approve this action",
-		"approve?",
-	} {
-		if strings.Contains(text, phrase) {
-			return "NeedsApproval", phrase
+// promptDetectionLoop is the prompt-state detector. On a fixed cadence it
+// captures the rendered tmux pane for each live run and asks the provider
+// adapter to classify it. Detection reads only the rendered snapshot (never raw
+// PTY bytes or provider transcripts), and an uncertain result records nothing,
+// so it never fabricates a NeedsInput/NeedsApproval — matching spec Prompt-State
+// Detection ("uncertainty degrades to Live or Quiet").
+func (s *Server) promptDetectionLoop(ctx context.Context) {
+	ticker := time.NewTicker(promptDetectionInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.detectPrompts(ctx)
 		}
 	}
-	for _, phrase := range []string{
-		"input required",
-		"waiting for input",
-		"enter your prompt",
-		"type your message",
-		"press enter to continue",
-	} {
-		if strings.Contains(text, phrase) {
-			return "NeedsInput", phrase
+}
+
+func (s *Server) detectPrompts(ctx context.Context) {
+	targets, err := s.store.LiveRunPromptTargets(ctx)
+	if err != nil {
+		s.log.Error("prompt detection scan failed", "error", err.Error())
+		return
+	}
+	tmux := tmuxClient()
+	for _, target := range targets {
+		rendered, err := tmux.CapturePane(ctx, target.SessionName)
+		if err != nil {
+			continue // pane unavailable: uncertain, never fabricate a prompt
+		}
+		hint := provider.DetectPromptState(target.ProviderKey, rendered)
+		switch hint.Status {
+		case "":
+			continue // uncertain: pane blank/unavailable, assert nothing
+		case provider.PromptStatusNone:
+			// Readable pane, no prompt: clear a stale pin so the run returns to
+			// its derived Live/Quiet rather than sticking on NeedsInput forever.
+			if err := s.store.ClearPromptHint(ctx, target.RunID); err != nil {
+				s.log.Error("clear prompt hint failed", "runId", target.RunID, "error", err.Error())
+			}
+		default:
+			if err := s.store.RecordPromptHint(ctx, target.RunID, hint.Status, hint.Detail); err != nil {
+				s.log.Error("record prompt hint failed", "runId", target.RunID, "error", err.Error())
+			}
 		}
 	}
-	return "", ""
 }
 
 func activeSessionStatus(status string) bool {
@@ -1528,7 +2103,7 @@ func (s *Server) stopRun(ctx context.Context, params StopRunParams) (StopRunResu
 	if err := s.store.RecordStopRequested(ctx, detail.RunID, params.Session); err != nil {
 		return StopRunResult{}, err
 	}
-	termination, err := requestRunnerStop(detail.RunnerSocket)
+	termination, err := requestRunnerStop(detail.RunnerSocket, s.gracefulStopTimeout)
 	if err != nil {
 		return StopRunResult{}, err
 	}
@@ -1548,7 +2123,7 @@ func (s *Server) killRun(ctx context.Context, session string) (KillRunResult, er
 		return KillRunResult{}, err
 	}
 	if detail.RunnerSocket != "" {
-		termination, err := requestRunnerKill(detail.RunnerSocket)
+		termination, err := requestRunnerKill(detail.RunnerSocket, s.gracefulStopTimeout)
 		if err != nil {
 			return KillRunResult{}, err
 		}
@@ -1828,14 +2403,41 @@ func (s *Server) repair(ctx context.Context, params RepairParams) (RepairResult,
 func (s *Server) doctor(ctx context.Context) (DoctorReport, error) {
 	report := DoctorReport{StateDB: s.cfg.StateDB, Issues: []DoctorIssue{}}
 	for _, cap := range provider.Catalog() {
-		if _, err := exec.LookPath(cap.Command); err != nil {
+		candidates := cap.CommandCandidates
+		if len(candidates) == 0 {
+			candidates = []string{cap.Command}
+		}
+		found := false
+		for _, candidate := range candidates {
+			if _, err := exec.LookPath(candidate); err == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
 			report.Issues = append(report.Issues, DoctorIssue{
-				Code: "ProviderCLIMissing", Severity: "Warning",
-				Target:  map[string]any{"provider": cap.ProviderKey, "command": cap.Command},
+				Code: "ProviderCliMissing", Severity: "Warning",
+				Target:  map[string]any{"provider": cap.ProviderKey, "commands": candidates},
 				Summary: cap.DisplayName + " CLI is missing.",
-				Detail:  err.Error(),
+				Detail:  "none of the candidate commands were found on PATH",
 			})
 		}
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		report.Issues = append(report.Issues, DoctorIssue{
+			Code: "GitCliMissing", Severity: "Blocker",
+			Target:  map[string]any{"command": "git"},
+			Summary: "git CLI is missing.",
+			Detail:  err.Error(),
+		})
+	}
+	if _, err := tmuxClient().Probe(ctx); err != nil && errors.Is(err, tmuxadapter.ErrTmuxMissing) {
+		report.Issues = append(report.Issues, DoctorIssue{
+			Code: "TmuxCliMissing", Severity: "Blocker",
+			Target:  map[string]any{"command": "tmux"},
+			Summary: "tmux CLI is missing.",
+			Detail:  err.Error(),
+		})
 	}
 	sessions, err := s.listSessions(ctx)
 	if err != nil {
@@ -1867,6 +2469,30 @@ func (s *Server) doctor(ctx context.Context) (DoctorReport, error) {
 			})
 		}
 	}
+	// Prompt-detection fingerprints: a live pane that matches no known provider
+	// TUI fingerprint means the heuristics have drifted from the provider's
+	// current UI. Surface it so silent detection breakage is observable, not a
+	// quietly stuck NeedsInput. A blank/unavailable pane is uncertain, not a hit.
+	promptTargets, err := s.store.LiveRunPromptTargets(ctx)
+	if err != nil {
+		return DoctorReport{}, err
+	}
+	fpTmux := tmuxClient()
+	for _, target := range promptTargets {
+		rendered, err := fpTmux.CapturePane(ctx, target.SessionName)
+		if err != nil || strings.TrimSpace(rendered) == "" {
+			continue
+		}
+		if provider.FingerprintKnown(target.ProviderKey, rendered) {
+			continue
+		}
+		report.Issues = append(report.Issues, DoctorIssue{
+			Code: "PromptFingerprintUnknown", Severity: "Warning",
+			Target:  map[string]any{"run": target.RunID, "provider": target.ProviderKey},
+			Summary: "Prompt-detection heuristics no longer match the provider UI.",
+			Detail:  "The rendered pane matched no known " + target.ProviderKey + " fingerprint; prompt-state detection may be degraded.",
+		})
+	}
 	envs, err := s.store.LaunchEnvSnapshots(ctx)
 	if err != nil {
 		return DoctorReport{}, err
@@ -1892,6 +2518,18 @@ func (s *Server) doctor(ctx context.Context) (DoctorReport, error) {
 		return DoctorReport{}, err
 	}
 	for _, project := range projects {
+		if info, err := os.Stat(project.RootPath); err != nil || !info.IsDir() {
+			detail := project.RootPath + " is not an existing directory."
+			if err != nil {
+				detail = err.Error()
+			}
+			report.Issues = append(report.Issues, DoctorIssue{
+				Code: "InvalidProjectRoot", Severity: "Blocker",
+				Target:  map[string]any{"project": project.Key, "path": project.RootPath},
+				Summary: "Project root is missing.",
+				Detail:  detail,
+			})
+		}
 		worktrees, err := s.store.ListActiveManagedWorktrees(ctx, project.ID)
 		if err != nil {
 			return DoctorReport{}, err
@@ -2192,7 +2830,7 @@ func (s *Server) initProject(ctx context.Context, cwd, replayKey string) (Projec
 	if err != nil {
 		return ProjectResult{}, err
 	}
-	if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+	if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 		return ProjectResult{}, err
 	}
 	return publicProject(project), nil
@@ -2293,7 +2931,7 @@ func (s *Server) saveProfile(ctx context.Context, params ProfileSaveParams) (Pro
 	if err := s.store.UpsertProfile(ctx, params.Profile, params.Provider, params.Model, params.Effort, policyJSON); err != nil {
 		return ProfileSaveResult{}, err
 	}
-	if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+	if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 		return ProfileSaveResult{}, err
 	}
 	return ProfileSaveResult{Profile: params.Profile, Provider: params.Provider}, nil
@@ -2315,7 +2953,7 @@ func (s *Server) setDefaultProfile(ctx context.Context, params ProfileDefaultPar
 	if err := s.store.SetProjectDefaultProfile(ctx, project.Key, params.Profile); err != nil {
 		return ProfileDefaultResult{}, err
 	}
-	if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+	if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 		return ProfileDefaultResult{}, err
 	}
 	return ProfileDefaultResult{Project: project.Key, Profile: params.Profile}, nil
@@ -2370,7 +3008,7 @@ func (s *Server) setConfig(ctx context.Context, params ConfigSetParams) (ConfigS
 		if err := s.store.SetProjectDefaultBaseRef(ctx, project.Key, params.Value); err != nil {
 			return ConfigSetResult{}, err
 		}
-		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 			return ConfigSetResult{}, err
 		}
 		return ConfigSetResult{Key: params.Key, Value: params.Value}, nil
@@ -2383,7 +3021,7 @@ func (s *Server) setConfig(ctx context.Context, params ConfigSetParams) (ConfigS
 		if err := s.store.SetProjectDefaultHost(ctx, project.Key, params.Value); err != nil {
 			return ConfigSetResult{}, err
 		}
-		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 			return ConfigSetResult{}, err
 		}
 		return ConfigSetResult{Key: params.Key, Value: params.Value}, nil
@@ -2400,7 +3038,7 @@ func (s *Server) setConfig(ctx context.Context, params ConfigSetParams) (ConfigS
 		if err != nil {
 			return ConfigSetResult{}, err
 		}
-		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 			return ConfigSetResult{}, err
 		}
 		return ConfigSetResult{Key: params.Key, Value: storage.WorktreeModeConfigValue(value)}, nil
@@ -2409,7 +3047,7 @@ func (s *Server) setConfig(ctx context.Context, params ConfigSetParams) (ConfigS
 		if _, err := s.store.UpsertHostAccess(ctx, key, params.Value); err != nil {
 			return ConfigSetResult{}, err
 		}
-		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB); err != nil {
+		if err := s.store.RecordEffectiveConfigRevision(ctx, s.cfg.StateDB, s.config); err != nil {
 			return ConfigSetResult{}, err
 		}
 		return ConfigSetResult{Key: params.Key, Value: params.Value}, nil
@@ -2713,7 +3351,7 @@ func (s *Server) startSession(ctx context.Context, params StartSessionParams) (S
 		return StartSessionResult{}, err
 	}
 	created.Env = params.Env
-	if err := startRunnerInTmux(ctx, s.store, tmux, runnerBin, created, runnerTmuxSession(created)); err != nil {
+	if err := startRunnerInTmux(ctx, s.store, tmux, runnerBin, created, runnerTmuxSession(created), s.config.Timing.HeartbeatIntervalMs); err != nil {
 		_ = s.store.MarkStartFailed(ctx, created.RunID, err.Error())
 		return StartSessionResult{}, err
 	}
@@ -2774,7 +3412,7 @@ func (s *Server) startRun(ctx context.Context, params StartRunParams) (StartRunR
 	if err != nil {
 		return StartRunResult{}, err
 	}
-	if err := startRunnerInTmux(ctx, s.store, tmux, runnerBin, created, runnerTmuxSession(created)); err != nil {
+	if err := startRunnerInTmux(ctx, s.store, tmux, runnerBin, created, runnerTmuxSession(created), s.config.Timing.HeartbeatIntervalMs); err != nil {
 		_ = s.store.MarkStartFailed(ctx, created.RunID, err.Error())
 		return StartRunResult{}, err
 	}
@@ -2794,7 +3432,7 @@ func (s *Server) evaluateWorktreeClose(ctx context.Context, wt storage.ManagedWo
 	tmux := tmuxClient()
 	findings, err := safety.EvaluateWorktreeClose(ctx, safety.WorktreeCloseInput{
 		Worktree: wt, GitStatus: status, Worktrees: worktrees, LiveSessions: liveDetails,
-		TargetExists: tmux.TargetExists,
+		TargetExists: tmux.TargetExists, RunnerLost: s.runnerLost,
 	})
 	if err != nil {
 		return nil, err
@@ -2806,9 +3444,12 @@ func restoreWorktreeMarker(wt storage.ManagedWorktree) {
 	_ = os.WriteFile(wt.MarkerFilePath, []byte(wt.MarkerFileHash+"\n"), 0600)
 }
 
-func startRunnerInTmux(ctx context.Context, store *storage.Store, tmux tmuxadapter.Adapter, runnerBin string, created storage.CreatedRun, sessionName string) error {
+func startRunnerInTmux(ctx context.Context, store *storage.Store, tmux tmuxadapter.Adapter, runnerBin string, created storage.CreatedRun, sessionName string, heartbeatIntervalMs int) error {
 	socket := defaultRunnerSocket(created.RunID)
 	args := []string{runnerBin, "-run-id", created.RunID, "-socket", socket, "-cwd", created.WorkingDir}
+	if heartbeatIntervalMs > 0 {
+		args = append(args, "-heartbeat-interval-ms", strconv.Itoa(heartbeatIntervalMs))
+	}
 	envFile := ""
 	if len(created.Env) > 0 {
 		envFile = defaultRunnerEnvFile(created.RunID)
@@ -3001,15 +3642,17 @@ func requestHash(value any) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func requestRunnerStop(socketPath string) (runnerproto.Termination, error) {
-	return requestRunnerTerminal(socketPath, runnerproto.NewStop(true))
+func requestRunnerStop(socketPath string, wait time.Duration) (runnerproto.Termination, error) {
+	return requestRunnerTerminal(socketPath, runnerproto.NewStop(true), wait)
 }
 
-func requestRunnerKill(socketPath string) (runnerproto.Termination, error) {
-	return requestRunnerTerminal(socketPath, runnerproto.NewKill())
+func requestRunnerKill(socketPath string, wait time.Duration) (runnerproto.Termination, error) {
+	return requestRunnerTerminal(socketPath, runnerproto.NewKill(), wait)
 }
 
-func requestRunnerTerminal(socketPath string, msg any) (runnerproto.Termination, error) {
+// requestRunnerTerminal sends a stop/kill and waits up to wait for the runner to
+// report its Exit. wait is the config-owned graceful_stop_timeout_ms bound.
+func requestRunnerTerminal(socketPath string, msg any, wait time.Duration) (runnerproto.Termination, error) {
 	conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
 	if err != nil {
 		return runnerproto.Termination{}, err
@@ -3024,7 +3667,7 @@ func requestRunnerTerminal(socketPath string, msg any) (runnerproto.Termination,
 	if err := runnerproto.WriteMessage(conn, msg); err != nil {
 		return runnerproto.Termination{}, err
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		msg, err := runnerproto.ReadMessage(conn)
@@ -3128,6 +3771,35 @@ func writeResponse(conn net.Conn, result any, err error) error {
 	return json.NewEncoder(conn).Encode(response{OK: true, Result: raw})
 }
 
+// assertPrivateSocketDir creates the API socket's parent directory 0700 and
+// verifies it is not group/world-accessible. MkdirAll leaves a pre-existing
+// directory's permissions untouched, so an attacker who pre-created a wide
+// directory (for example under a shared runtime base) could otherwise remove or
+// replace the socket and MITM the API. A directory wider than 0700 is a
+// startup defect, not a warning.
+func assertPrivateSocketDir(dir string) error {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	// Tighten first: chmod succeeds only if we own the directory, so a directory
+	// an attacker pre-created (and we cannot chmod) fails here rather than being
+	// used. A directory we own is self-healed to 0700.
+	if err := os.Chmod(dir, 0700); err != nil {
+		return err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("api socket path parent %s is not a directory", dir)
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return fmt.Errorf("api socket directory %s permissions %s are wider than 0700", dir, info.Mode().Perm())
+	}
+	return nil
+}
+
 func removeStaleSocket(path string) error {
 	conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
 	if err == nil {
@@ -3143,10 +3815,12 @@ func removeStaleSocket(path string) error {
 	return nil
 }
 
+// verifyPeer authenticates a client connection by its socket peer credentials
+// before any dispatch. The platform-specific uid lookup lives in peercred_*.go;
+// unsupported platforms fail closed (reject) rather than fail open. The
+// supervisor API can launch processes and write to a PTY, so this gate is
+// mandatory on every connection.
 func verifyPeer(conn net.Conn) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
 		return errors.New("supervisor requires Unix socket clients")
@@ -3155,17 +3829,17 @@ func verifyPeer(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
-	var cred *unix.Ucred
-	var controlErr error
+	var uid int
+	var lookupErr error
 	if err := raw.Control(func(fd uintptr) {
-		cred, controlErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+		uid, lookupErr = peerUID(fd)
 	}); err != nil {
 		return err
 	}
-	if controlErr != nil {
-		return controlErr
+	if lookupErr != nil {
+		return lookupErr
 	}
-	if cred == nil || cred.Uid != uint32(os.Getuid()) {
+	if uid != os.Geteuid() {
 		return errors.New("supervisor peer credential mismatch")
 	}
 	return nil

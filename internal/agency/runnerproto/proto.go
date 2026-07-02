@@ -10,9 +10,20 @@ import (
 
 const (
 	ProtocolVersion = 1
-	Magic           = "agency.runner"
-	MaxFrameBytes   = 8 << 20
+	// MinSupportedProtocolVersion is the oldest wire version a current supervisor
+	// still adopts. Because runners outlive supervisor upgrades, a supervisor
+	// adopts any runner in [MinSupportedProtocolVersion, ProtocolVersion] and
+	// quarantines (never kills) anything outside that range.
+	MinSupportedProtocolVersion = 1
+	Magic                       = "agency.runner"
+	MaxFrameBytes               = 8 << 20
 )
+
+// SupportedProtocolVersion reports whether a runner announcing protocol version
+// v is adoptable by this supervisor (current or a supported prior version).
+func SupportedProtocolVersion(v int) bool {
+	return v >= MinSupportedProtocolVersion && v <= ProtocolVersion
+}
 
 type Preamble struct {
 	Magic                 string `json:"magic"`
@@ -202,6 +213,18 @@ type envelope struct {
 	Type MessageType `json:"type"`
 }
 
+// Unknown is returned by ReadMessage for a frame whose message type this binary
+// does not recognize. The runner wire protocol is versioned and
+// forward-compatible (the opposite policy from the hard-cutover database
+// schema): a peer that outlives an upgrade must skip message types it does not
+// know rather than dropping the connection. The frame is fully consumed before
+// this is returned, so the stream stays byte-aligned and the next frame can be
+// read normally.
+type Unknown struct {
+	Type MessageType
+	Raw  []byte
+}
+
 func WritePreamble(w io.Writer, p Preamble) error {
 	return WriteFrame(w, p)
 }
@@ -272,7 +295,10 @@ func ReadMessage(r io.Reader) (any, error) {
 		err = json.Unmarshal(raw, &msg)
 		return msg, err
 	default:
-		return nil, fmt.Errorf("unknown runner message type %q", env.Type)
+		// Forward-compatible: never drop the connection on an unrecognized
+		// message type. The frame is already fully read, so the caller can skip
+		// this value and continue reading subsequent frames.
+		return Unknown{Type: env.Type, Raw: raw}, nil
 	}
 }
 

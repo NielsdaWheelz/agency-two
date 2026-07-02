@@ -182,6 +182,61 @@ func RenderDoctor(w io.Writer, report supervisor.DoctorReport) {
 	}
 }
 
+// LauncherView is the data for the launcher screen: the controls that will be
+// used and the exact command preview, plus any blocking validation messages.
+type LauncherView struct {
+	Provider       string
+	Profile        string
+	Model          string
+	Effort         string
+	WorkspaceMode  string
+	BaseRef        string
+	PermissionMode string
+	SandboxMode    string
+	ApprovalPolicy string
+	CommandPreview string
+	Validation     []string
+}
+
+// RenderLauncher renders the launcher view. When validation messages are
+// present the launch is blocked, matching the "launch button disabled when
+// validation fails" rule.
+func RenderLauncher(w io.Writer, view LauncherView) {
+	fmt.Fprintln(w, "Agency launcher")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "provider:", view.Provider)
+	if view.Profile != "" {
+		fmt.Fprintln(w, "profile:", view.Profile)
+	}
+	fmt.Fprintln(w, "model:", view.Model)
+	fmt.Fprintln(w, "effort:", view.Effort)
+	if view.WorkspaceMode != "" {
+		fmt.Fprintln(w, "workspace:", view.WorkspaceMode)
+	}
+	if view.BaseRef != "" {
+		fmt.Fprintln(w, "base:", view.BaseRef)
+	}
+	if view.PermissionMode != "" {
+		fmt.Fprintln(w, "permission-mode:", view.PermissionMode)
+	}
+	if view.SandboxMode != "" {
+		fmt.Fprintln(w, "sandbox:", view.SandboxMode)
+	}
+	if view.ApprovalPolicy != "" {
+		fmt.Fprintln(w, "approval-policy:", view.ApprovalPolicy)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Command preview")
+	fmt.Fprintln(w, "argv:", view.CommandPreview)
+	if len(view.Validation) > 0 {
+		fmt.Fprintln(w)
+		for _, message := range view.Validation {
+			fmt.Fprintln(w, message)
+		}
+		fmt.Fprintln(w, "Launch disabled.")
+	}
+}
+
 func RenderFooter(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "q quit | r refresh | b dashboard | s/status <session> | new <provider> | open/attach <session> | stop/close <session> | w worktrees | worktree close <workspace> | d doctor")

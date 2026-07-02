@@ -6,15 +6,122 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"agency-two/internal/agency/runner"
 	"agency-two/internal/agency/runnerproto"
 	"agency-two/internal/agency/storage"
+	tmuxadapter "agency-two/internal/agency/tmux"
 )
+
+func TestKeyedLocksSerializeAndAvoidDeadlock(t *testing.T) {
+	k := newKeyedLocks()
+
+	// The same key serializes: a second acquire blocks until the first releases.
+	release := k.acquire(sessionLockKey("a"))
+	acquired := make(chan struct{})
+	go func() {
+		r := k.acquire(sessionLockKey("a"))
+		close(acquired)
+		r()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("acquire on a held key did not block")
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("acquire did not proceed after release")
+	}
+
+	// Different keys do not block each other.
+	held := k.acquire(sessionLockKey("x"))
+	free := make(chan struct{})
+	go func() { r := k.acquire(sessionLockKey("y")); r(); close(free) }()
+	select {
+	case <-free:
+	case <-time.After(time.Second):
+		t.Fatal("distinct keys blocked each other")
+	}
+	held()
+
+	// Concurrent multi-key acquisition in opposite argument orders must not
+	// deadlock; acquire sorts keys into one global order.
+	var wg sync.WaitGroup
+	for _, keys := range [][]string{
+		{workspaceLockKey("1"), sessionLockKey("1")},
+		{sessionLockKey("1"), workspaceLockKey("1")},
+	} {
+		wg.Add(1)
+		go func(ks []string) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				r := k.acquire(ks...)
+				r()
+			}
+		}(keys)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("concurrent opposite-order multi-key acquire deadlocked")
+	}
+}
+
+func TestReconcileReportsAdoptableOrphanWorktree(t *testing.T) {
+	cfg := testConfig(t)
+	store, err := storage.Open(context.Background(), cfg.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := store.EnsureProject(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanDir := filepath.Join(project.ManagedWorktreeRoot, "orphan-wt")
+	if err := os.MkdirAll(orphanDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, ".agency-worktree"), []byte("no-such-workspace-id\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cancel := startTestSupervisor(t, cfg)
+	defer cancel()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		store, err := storage.Open(context.Background(), cfg.StateDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := store.DB.QueryRowContext(context.Background(), `select count(*) from events where event_type='DoctorIssueObserved'`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		_ = store.Close()
+		if count >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("adoptable orphan was not reported as DoctorIssueObserved")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
 
 func TestSupervisorHealthAndListSessions(t *testing.T) {
 	cfg := testConfig(t)
@@ -139,6 +246,44 @@ func TestSupervisorLockMetadataIsTruncated(t *testing.T) {
 	}
 }
 
+func TestSupervisorTCPTunnelRequiresToken(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.TCPTunnelAddr = "127.0.0.1:0"
+	cancel := startTestSupervisor(t, cfg)
+	defer cancel()
+
+	runtimeDir := filepath.Dir(cfg.SocketPath)
+	addrRaw, err := os.ReadFile(filepath.Join(runtimeDir, "tunnel.addr"))
+	if err != nil {
+		t.Fatalf("tunnel addr file: %v", err)
+	}
+	tokenRaw, err := os.ReadFile(filepath.Join(runtimeDir, "tunnel.token"))
+	if err != nil {
+		t.Fatalf("tunnel token file: %v", err)
+	}
+	addr := string(addrRaw)
+	token := string(tokenRaw)
+
+	var health Health
+	if err := CallTCP(context.Background(), addr, "wrong-token", "health", nil, &health); err == nil {
+		t.Fatal("tunnel accepted a wrong bearer token")
+	}
+	if err := CallTCP(context.Background(), addr, token, "health", nil, &health); err != nil {
+		t.Fatalf("tunnel rejected the valid token: %v", err)
+	}
+	if health.Status != "Live" {
+		t.Fatalf("health over tunnel = %+v", health)
+	}
+	// The token file must be private.
+	info, err := os.Stat(filepath.Join(runtimeDir, "tunnel.token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("tunnel token mode = %s, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestSupervisorRemovesStaleSocket(t *testing.T) {
 	cfg := testConfig(t)
 	if err := os.MkdirAll(filepath.Dir(cfg.SocketPath), 0700); err != nil {
@@ -234,7 +379,12 @@ func TestSupervisorQuarantinesIncompatibleRunnerOnStartup(t *testing.T) {
 	}
 }
 
-func TestSupervisorMarksOldUnreachableRunnerOrphanedOnStartup(t *testing.T) {
+func TestSupervisorDoesNotOrphanRunnerFromStaleWallClockOnStartup(t *testing.T) {
+	// A binding carrying an ancient wall-clock last_heartbeat_at (from before a
+	// supervisor restart) must NOT be orphaned on startup: liveness is monotonic
+	// and every binding is unproven-but-not-lost until its fresh TTL window
+	// elapses. This guards spec Time And Clocks ("never declared lost from a
+	// wall-clock delta that spans a restart").
 	cfg := testConfig(t)
 	runID := seedBoundRun(t, cfg, filepath.Join(filepath.Dir(cfg.SocketPath), "missing-runner.sock"))
 	store, err := storage.Open(context.Background(), cfg.StateDB)
@@ -254,6 +404,41 @@ func TestSupervisorMarksOldUnreachableRunnerOrphanedOnStartup(t *testing.T) {
 	health, err := HealthCheck(context.Background(), cfg.SocketPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if health.OrphanedRunners != 0 {
+		t.Fatalf("stale wall-clock heartbeat orphaned a runner across restart: health = %+v", health)
+	}
+	sessions, err := ListSessions(context.Background(), cfg.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].RunStatus == "Failed" || sessions[0].RunStatus == "LostRunner" {
+		t.Fatalf("within-TTL unproven runner should not be lost: sessions = %+v", sessions)
+	}
+}
+
+func TestSupervisorOrphansUnreachableRunnerAfterHeartbeatTTL(t *testing.T) {
+	// Once the monotonic grace window elapses, an unreachable runner is orphaned.
+	cfg := testConfig(t)
+	cfg.HeartbeatTTL = time.Millisecond
+	cfg.ReconcileInterval = 15 * time.Millisecond
+	seedBoundRun(t, cfg, filepath.Join(filepath.Dir(cfg.SocketPath), "missing-runner.sock"))
+
+	cancel := startTestSupervisor(t, cfg)
+	defer cancel()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var health Health
+	for time.Now().Before(deadline) {
+		var err error
+		health, err = HealthCheck(context.Background(), cfg.SocketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if health.OrphanedRunners == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if health.OrphanedRunners != 1 || health.AdoptedRunners != 0 || health.QuarantinedRunners != 0 {
 		t.Fatalf("health = %+v", health)
@@ -551,22 +736,49 @@ func TestSupervisorPersistsRunnerStreamHeartbeats(t *testing.T) {
 	t.Fatal("supervisor did not persist stream heartbeat")
 }
 
-func TestSupervisorRecordsPromptHintFromRunnerOutput(t *testing.T) {
+func TestSupervisorRecordsPromptHintFromRenderedPane(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is not installed")
+	}
 	cfg := testConfig(t)
+	// Isolate a dedicated tmux server, shared by the test's adapter and the
+	// supervisor's tmuxClient() (both read AGENCY_TMUX_SOCKET).
+	tmuxSocket := filepath.Join(t.TempDir(), "tmux.sock")
+	t.Setenv("AGENCY_TMUX_SOCKET", tmuxSocket)
+	adapter := tmuxadapter.NewWithSocketPath(tmuxSocket)
+	sessionName := "agency-prompt-detect"
+	if _, err := adapter.CreateRunnerTarget(context.Background(), sessionName, `sh -c 'printf "waiting for approval before running command\n"; sleep 30'`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adapter.KillTarget(context.Background(), sessionName) }()
+
 	runnerSocket := filepath.Join(filepath.Dir(cfg.SocketPath), "runner-prompt.sock")
 	runID := seedBoundRun(t, cfg, runnerSocket)
-	stopRunner := serveRunnerWithOutput(t, runnerSocket, runnerproto.Preamble{
+	// Point the run's tmux target at the real pane the prompt detector captures.
+	seedStore, err := storage.Open(context.Background(), cfg.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedStore.DB.ExecContext(context.Background(), `update tmux_targets set target_spec_json=? where tmux_target_id in (
+		select st.tmux_target_id from session_tmux_targets st join agent_runs r on r.session_id=st.session_id where r.run_id=? and st.detached_at is null)`,
+		`{"session":"`+sessionName+`","window":"runner","pane":"0"}`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stopRunner := serveRunnerPreamble(t, runnerSocket, runnerproto.Preamble{
 		Magic:                 runnerproto.Magic,
 		RunnerProtocolVersion: runnerproto.ProtocolVersion,
 		RunnerBinaryVersion:   "test-runner",
 		RunID:                 runID,
-	}, []byte("approval required before running command\n"))
+	})
 	defer stopRunner()
 
 	cancelSupervisor := startTestSupervisor(t, cfg)
 	defer cancelSupervisor()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		store, err := storage.Open(context.Background(), cfg.StateDB)
 		if err != nil {
@@ -583,6 +795,8 @@ func TestSupervisorRecordsPromptHintFromRunnerOutput(t *testing.T) {
 			if err := store.DB.QueryRowContext(context.Background(), `select count(*) from events where event_type='RunNeedsApproval'`).Scan(&events); err != nil {
 				t.Fatal(err)
 			}
+			// The notification worker delivers asynchronously (decoupled from the
+			// event write); poll until it records the terminal delivery.
 			if err := store.DB.QueryRowContext(context.Background(), `select count(*)
 				from notification_deliveries d
 				join events e on e.event_id=d.event_id
@@ -592,10 +806,11 @@ func TestSupervisorRecordsPromptHintFromRunnerOutput(t *testing.T) {
 			if err := store.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if events != 1 || deliveries != 1 {
-				t.Fatalf("events=%d deliveries=%d, want 1/1", events, deliveries)
+			if events == 1 && deliveries == 1 {
+				return
 			}
-			return
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
@@ -639,7 +854,7 @@ func TestSupervisorResubscribesRunnerOutputFromNextChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &Server{store: store, outputSubscriptions: map[string]context.CancelFunc{}}
+	server := &Server{store: store, outputSubscriptions: map[string]context.CancelFunc{}, runnerHeartbeats: map[string]time.Time{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
@@ -857,6 +1072,8 @@ func testConfig(t *testing.T) Config {
 	if err := os.Mkdir(stateDir, 0700); err != nil {
 		t.Fatal(err)
 	}
+	// Isolate config discovery so open() loads the built-in default config.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	return Config{
 		StateDB:    filepath.Join(stateDir, "agency.db"),
 		SocketPath: filepath.Join(dir, "supervisor.sock"),

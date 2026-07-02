@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,8 +19,45 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Per-connection pragma values. SQLite applies these per connection (and
+// defaults foreign_keys OFF), so they are encoded in the DSN — see connDSN —
+// rather than executed once on the pool. They are named constants so the
+// configuration service can supply [retention].busy_timeout_ms and
+// journal_size_limit_bytes without changing the storage layer.
+const (
+	busyTimeoutMs         = 5000
+	journalSizeLimitBytes = 67108864
+)
+
 type Store struct {
 	DB *sql.DB
+	// quietThreshold is the config-owned output-silence bound used by
+	// deriveRunStatus. Seeded to defaultQuietThreshold and overridden by the
+	// supervisor from [timing].quiet_threshold_ms via SetQuietThreshold.
+	quietThreshold time.Duration
+}
+
+// SetQuietThreshold overrides the output-silence bound that separates Live from
+// Quiet. A non-positive value is ignored so a missing/zero config key leaves the
+// schema default in force rather than collapsing the threshold to zero.
+func (s *Store) SetQuietThreshold(d time.Duration) {
+	if d > 0 {
+		s.quietThreshold = d
+	}
+}
+
+// connDSN builds a modernc sqlite DSN that applies the per-connection pragmas
+// to every physical connection the pool opens — including a replacement opened
+// after a dropped connection — so foreign key enforcement can never silently
+// revert to SQLite's OFF default on a recycled connection. journal_mode=WAL and
+// auto_vacuum are persistent in the database header and are set once at
+// migration time, so they are intentionally not in the DSN.
+func connDSN(path string) string {
+	q := url.Values{}
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMs))
+	q.Add("_pragma", "foreign_keys(1)")
+	q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", journalSizeLimitBytes))
+	return "file:" + path + "?" + q.Encode()
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -29,12 +67,12 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := preparePrivateDBFile(path); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", connDSN(path))
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{DB: db}
+	s := &Store{DB: db, quietThreshold: defaultQuietThreshold}
 	if err := s.applyPragmas(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -141,23 +179,23 @@ func (s *Store) Export(ctx context.Context, path string) error {
 	return os.Chmod(path, 0600)
 }
 
+// applyPragmas asserts that the DSN-supplied per-connection pragmas are in
+// effect. foreign_keys is load-bearing: with it OFF every `references` clause is
+// inert, so a missing enforcement is a startup defect, not a warning.
 func (s *Store) applyPragmas(ctx context.Context) error {
-	pragmas := []string{
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA journal_size_limit=67108864",
-	}
-	for _, p := range pragmas {
-		if _, err := s.DB.ExecContext(ctx, p); err != nil {
-			return err
-		}
-	}
 	var enabled int
 	if err := s.DB.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&enabled); err != nil {
 		return err
 	}
 	if enabled != 1 {
-		return errors.New("foreign_keys pragma did not enable")
+		return errors.New("foreign_keys pragma is not enabled on the connection")
+	}
+	var busyTimeout int
+	if err := s.DB.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		return err
+	}
+	if busyTimeout != busyTimeoutMs {
+		return fmt.Errorf("busy_timeout=%d, want %d", busyTimeout, busyTimeoutMs)
 	}
 	return nil
 }
@@ -208,6 +246,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 		}
 	}
 
+	// Version 1 on a fresh database: set the persistent header pragmas before
+	// any table exists. journal_mode=WAL must run outside a transaction and
+	// auto_vacuum=INCREMENTAL only takes effect when set on an empty database,
+	// so both are applied here, ahead of the schema transaction.
+	if _, err := s.DB.ExecContext(ctx, "PRAGMA journal_mode=WAL"); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, "PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
+		return err
+	}
+
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -226,13 +275,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if _, err := s.DB.ExecContext(ctx, "PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
-		return err
-	}
-	return nil
+	return tx.Commit()
 }
 
 func Now() string {

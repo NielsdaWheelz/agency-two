@@ -1049,11 +1049,13 @@ agency new <provider> [prompt]
 agency run <session>
 agency list
 agency status <session>
+agency events <session>            # audit event log for a session
 agency diff <session>
 agency attach <session>
 agency send <session> [message]
 agency rename <session> <title>
-agency stop <session>
+agency stop <session>              # graceful stop (escalates after graceful_stop_timeout_ms)
+agency kill <session>             # forced termination
 agency close <session>
 agency close --terminal            # bulk close terminal sessions
 agency worktree list
@@ -1067,6 +1069,11 @@ agency profile set <profile> [controls]
 agency profile set-default <profile>
 agency project init
 agency project list
+agency host list
+agency host check <alias>          # verify SSH reachability + remote prerequisites
+agency host discover <alias>       # locate a remote supervisor over SSH
+agency host start <alias>          # start a remote supervisor over SSH
+agency host install-unit           # install the systemd/launchd auto-start unit
 agency doctor [--supervisor]
 agency repair <repair-key>
 agency prune

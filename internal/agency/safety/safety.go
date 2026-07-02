@@ -23,6 +23,10 @@ type WorktreeCloseInput struct {
 	Worktrees    []gitx.Worktree
 	LiveSessions []storage.SessionDetail
 	TargetExists func(context.Context, string) (bool, error)
+	// RunnerLost reports whether a run's runner has missed its heartbeat TTL on
+	// the supervisor's monotonic clock. Liveness is never derived from a
+	// persisted wall-clock delta, so the safety service asks the run owner.
+	RunnerLost func(runID string) bool
 }
 
 func EvaluateWorktreeClose(ctx context.Context, input WorktreeCloseInput) ([]Finding, error) {
@@ -83,21 +87,22 @@ func EvaluateWorktreeClose(ctx context.Context, input WorktreeCloseInput) ([]Fin
 	if len(input.LiveSessions) > 1 {
 		add(gitx.BlockerWorkspaceShared, map[string]any{"liveSessionCount": len(input.LiveSessions)})
 	}
-	if input.TargetExists != nil {
-		for _, detail := range input.LiveSessions {
-			if detail.Summary.RunStatus == "LostRunner" {
-				add(gitx.BlockerRunnerHeartbeatExpired, map[string]any{"session": detail.Summary.Session})
-			}
-			if detail.RunnerSocket == "" {
-				continue
-			}
-			ok, err := input.TargetExists(ctx, detail.TmuxSessionName)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				add(gitx.BlockerTmuxTargetMissing, map[string]any{"session": detail.Summary.Session, "tmuxTarget": detail.TmuxSessionName})
-			}
+	for _, detail := range input.LiveSessions {
+		// RunnerHeartbeatExpired is a structural blocker: always enforced,
+		// independent of the tmux observation, and evaluated on the monotonic
+		// clock via the injected predicate (never a persisted wall-clock delta).
+		if input.RunnerLost != nil && detail.Summary.HasActiveBinding && input.RunnerLost(detail.Summary.RunID) {
+			add(gitx.BlockerRunnerHeartbeatExpired, map[string]any{"session": detail.Summary.Session})
+		}
+		if input.TargetExists == nil || detail.RunnerSocket == "" {
+			continue
+		}
+		ok, err := input.TargetExists(ctx, detail.TmuxSessionName)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			add(gitx.BlockerTmuxTargetMissing, map[string]any{"session": detail.Summary.Session, "tmuxTarget": detail.TmuxSessionName})
 		}
 	}
 	return findings, nil

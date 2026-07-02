@@ -175,6 +175,26 @@ func (a Adapter) ServerIdentity(ctx context.Context) (ServerIdentity, error) {
 	return ServerIdentity{PID: pid, StartedAt: startedAt}, nil
 }
 
+// CapturePane returns the rendered visible content of a target's active pane
+// (ANSI processed by tmux into plain grid text). This is the only surface
+// prompt-state detection reads; it never touches provider-private transcripts.
+func (a Adapter) CapturePane(ctx context.Context, sessionName string) (string, error) {
+	if err := validateSessionName(sessionName); err != nil {
+		return "", err
+	}
+	if err := a.validate(); err != nil {
+		return "", err
+	}
+	out, err := a.run(ctx, "capture-pane", "-p", "-t", sessionName)
+	if err != nil {
+		if outputMeansMissing(out) {
+			return "", fmt.Errorf("%w: %s", ErrTargetMissing, cleanOutput(out))
+		}
+		return "", commandError("tmux capture-pane", err, out)
+	}
+	return string(out), nil
+}
+
 func (a Adapter) KillTarget(ctx context.Context, sessionName string) error {
 	if err := validateSessionName(sessionName); err != nil {
 		return err

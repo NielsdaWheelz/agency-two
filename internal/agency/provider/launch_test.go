@@ -93,13 +93,13 @@ func TestUnsupportedControlsReturnTypedInputErrors(t *testing.T) {
 		{"provider", LaunchInput{ProviderKey: "other"}, "ProviderNotFound", "provider"},
 		{"claude model", LaunchInput{ProviderKey: KeyClaude, Model: "unknown"}, "UnsupportedModel", "model"},
 		{"claude effort", LaunchInput{ProviderKey: KeyClaude, Effort: "minimal"}, "UnsupportedEffort", "effort"},
-		{"claude permission", LaunchInput{ProviderKey: KeyClaude, PermissionMode: "ask"}, "UnsupportedPermissionMode", "permission_mode"},
-		{"claude sandbox", LaunchInput{ProviderKey: KeyClaude, SandboxMode: "workspace-write"}, "UnsupportedProviderControl", "sandbox"},
+		{"claude permission", LaunchInput{ProviderKey: KeyClaude, PermissionMode: "ask"}, "UnsupportedControl", "permission_mode"},
+		{"claude sandbox", LaunchInput{ProviderKey: KeyClaude, SandboxMode: "workspace-write"}, "UnsupportedControl", "sandbox"},
 		{"codex model", LaunchInput{ProviderKey: KeyCodex, Model: "sonnet"}, "UnsupportedModel", "model"},
 		{"codex effort", LaunchInput{ProviderKey: KeyCodex, Effort: "max"}, "UnsupportedEffort", "effort"},
-		{"codex sandbox", LaunchInput{ProviderKey: KeyCodex, SandboxMode: "none"}, "UnsupportedSandboxMode", "sandbox"},
-		{"codex approval", LaunchInput{ProviderKey: KeyCodex, ApprovalPolicy: "always"}, "UnsupportedApprovalPolicy", "approval_policy"},
-		{"codex permission", LaunchInput{ProviderKey: KeyCodex, PermissionMode: "default"}, "UnsupportedProviderControl", "permission_mode"},
+		{"codex sandbox", LaunchInput{ProviderKey: KeyCodex, SandboxMode: "none"}, "UnsupportedControl", "sandbox"},
+		{"codex approval", LaunchInput{ProviderKey: KeyCodex, ApprovalPolicy: "always"}, "UnsupportedControl", "approval_policy"},
+		{"codex permission", LaunchInput{ProviderKey: KeyCodex, PermissionMode: "default"}, "UnsupportedControl", "permission_mode"},
 	}
 
 	for _, tc := range cases {
